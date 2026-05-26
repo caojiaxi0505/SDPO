@@ -58,6 +58,7 @@ class SelfDistillationConfig(BaseConfig):
         feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
         include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
+        uplift_calibration (dict[str, Any]): Optional reward-uplift calibration for scaling the distillation loss.
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
     """
@@ -90,6 +91,14 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    uplift_calibration: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "num_samples": 1,
+            "reward_upper_bound": 1.0,
+            "eps": 1e-6,
+        }
+    )
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
@@ -110,6 +119,12 @@ class SelfDistillationConfig(BaseConfig):
             )
         if self.is_clip is not None and self.is_clip <= 0:
             raise ValueError(f"self_distillation.is_clip must be positive, got {self.is_clip}")
+        if self.uplift_calibration.get("num_samples", 1) <= 0:
+            raise ValueError("self_distillation.uplift_calibration.num_samples must be positive")
+        if self.uplift_calibration.get("reward_upper_bound", 1.0) <= 0:
+            raise ValueError("self_distillation.uplift_calibration.reward_upper_bound must be positive")
+        if self.uplift_calibration.get("eps", 1e-6) <= 0:
+            raise ValueError("self_distillation.uplift_calibration.eps must be positive")
 
 
 @dataclass

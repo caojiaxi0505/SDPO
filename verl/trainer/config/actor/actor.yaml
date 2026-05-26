@@ -127,6 +127,14 @@ self_distillation:
   # IS clip for loss; null disables IS weighting
   is_clip: 2
 
+  # Reward-uplift calibration for scaling the distillation loss.
+  # Disabled by default to preserve the original SDPO behavior.
+  uplift_calibration:
+    enable: False
+    num_samples: 1
+    reward_upper_bound: 1.0
+    eps: 1e-6
+
   # Reprompting template - available variables: prompt, successful_previous_attempt, feedback
   reprompt_template: |-
     {prompt}{solution}{feedback}

@@ -690,6 +690,8 @@ class DataParallelPPOActor(BasePPOActor):
                 "teacher_position_ids",
                 "self_distillation_mask",
             }
+            if self_distillation_cfg.get("uplift_calibration", {}).get("enable", False):
+                self_distillation_required_keys.add("self_distillation_u")
             assert self_distillation_required_keys.issubset(set(data.batch.keys())), f"Missing required keys: {self_distillation_required_keys - set(data.batch.keys())}"
 
         select_keys = [
@@ -841,6 +843,7 @@ class DataParallelPPOActor(BasePPOActor):
                             student_topk_log_probs=student_topk_logps,
                             teacher_topk_log_probs=teacher_topk_logps,
                             self_distillation_mask=self_distillation_mask,
+                            self_distillation_weights=model_inputs.get("self_distillation_u"),
                             loss_agg_mode=loss_agg_mode,
                             rollout_is_weights=rollout_is_weights,
                         )

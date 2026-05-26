@@ -679,6 +679,7 @@ class RayPPOTrainer:
         loss_mode = self.config.actor_rollout_ref.actor.policy_loss.get("loss_mode", "vanilla")
         if self_distillation_cfg is None or loss_mode != "sdpo":
             return None
+        uplift_calibration_enabled = self_distillation_cfg.get("uplift_calibration", {}).get("enable", False)
 
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
@@ -788,12 +789,130 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
         }
-        return DataProto.from_dict(tensors={
+        tensors = {
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
             "teacher_position_ids": teacher_position_ids,
             "self_distillation_mask": self_distillation_mask,
-        }), metrics
+        }
+        if uplift_calibration_enabled:
+            teacher_prompt_attention_mask = teacher_prompt["attention_mask"].to(device)
+            tensors.update({
+                "teacher_prompt_input_ids": teacher_prompt["input_ids"].to(device),
+                "teacher_prompt_attention_mask": teacher_prompt_attention_mask,
+                "teacher_prompt_position_ids": compute_position_id_with_mask(teacher_prompt_attention_mask),
+            })
+        return DataProto.from_dict(tensors=tensors), metrics
+
+    def _compute_self_distillation_uplift_weights(
+        self,
+        batch: DataProto,
+        self_distillation_batch: DataProto,
+        reward_tensor: torch.Tensor,
+        timing_raw: dict[str, float],
+    ) -> tuple[DataProto, dict[str, float]]:
+        self_distillation_cfg = self.config.actor_rollout_ref.actor.self_distillation
+        uplift_cfg = self_distillation_cfg.get("uplift_calibration", {})
+        num_samples = int(uplift_cfg.get("num_samples", 1))
+        reward_upper_bound = float(uplift_cfg.get("reward_upper_bound", 1.0))
+        eps = float(uplift_cfg.get("eps", 1e-6))
+        if num_samples <= 0:
+            raise ValueError("self_distillation.uplift_calibration.num_samples must be positive")
+        if reward_upper_bound <= 0:
+            raise ValueError("self_distillation.uplift_calibration.reward_upper_bound must be positive")
+        if eps <= 0:
+            raise ValueError("self_distillation.uplift_calibration.eps must be positive")
+
+        prompt_keys = {
+            "teacher_prompt_input_ids",
+            "teacher_prompt_attention_mask",
+            "teacher_prompt_position_ids",
+        }
+        missing_prompt_keys = prompt_keys - set(self_distillation_batch.batch.keys())
+        if missing_prompt_keys:
+            raise ValueError(f"Missing uplift calibration prompt keys: {missing_prompt_keys}")
+
+        calibration_prompts = DataProto.from_dict(
+            tensors={
+                "input_ids": self_distillation_batch.batch["teacher_prompt_input_ids"],
+                "attention_mask": self_distillation_batch.batch["teacher_prompt_attention_mask"],
+                "position_ids": self_distillation_batch.batch["teacher_prompt_position_ids"],
+            },
+            non_tensors={k: v.copy() for k, v in batch.non_tensor_batch.items()},
+            meta_info={
+                "temperature": self.config.actor_rollout_ref.rollout.temperature,
+                "global_steps": self.global_steps,
+            },
+        )
+        calibration_prompts = calibration_prompts.repeat(repeat_times=num_samples, interleave=True)
+
+        size_divisor = (
+            self.actor_rollout_wg.world_size
+            if not self.async_rollout_mode
+            else self.config.actor_rollout_ref.rollout.agent.num_workers
+        )
+        calibration_prompts_padded, pad_size = pad_dataproto_to_divisor(calibration_prompts, size_divisor)
+        with marked_timer("self_distillation_uplift_gen", timing_raw, color="red"):
+            if not self.async_rollout_mode:
+                calibration_output_padded = self.actor_rollout_wg.generate_sequences(calibration_prompts_padded)
+            else:
+                calibration_output_padded = self.async_rollout_manager.generate_sequences(calibration_prompts_padded)
+            uplift_timing = calibration_output_padded.meta_info.pop("timing", {})
+            timing_raw.update({f"self_distillation_uplift/{k}": v for k, v in uplift_timing.items()})
+        calibration_output = unpad_dataproto(calibration_output_padded, pad_size=pad_size)
+
+        reward_batch = DataProto(
+            batch=calibration_output.batch,
+            non_tensor_batch=calibration_prompts.non_tensor_batch,
+            meta_info=calibration_output.meta_info,
+        )
+        if self.use_rm and "rm_scores" not in reward_batch.batch.keys():
+            if not self.use_reward_loop:
+                rm_scores = self.rm_wg.compute_rm_score(reward_batch)
+            else:
+                assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                rm_scores = self.reward_loop_manager.compute_rm_score(reward_batch)
+            reward_batch = reward_batch.union(rm_scores)
+
+        with marked_timer("self_distillation_uplift_reward", timing_raw, color="yellow"):
+            if self.config.reward_model.launch_reward_fn_async:
+                future_reward = compute_reward_async.remote(
+                    data=reward_batch, config=self.config, tokenizer=self.tokenizer, reward_fn=self.reward_fn
+                )
+                calibration_reward_tensor, _ = ray.get(future_reward)
+            else:
+                calibration_reward_tensor, _ = self._compute_or_extract_reward(
+                    reward_batch, reward_fn=self.reward_fn, return_dict=False
+                )
+
+        baseline_scores = reward_tensor.sum(dim=-1).detach().to(dtype=torch.float32)
+        calibration_scores = calibration_reward_tensor.sum(dim=-1).detach().to(
+            device=baseline_scores.device, dtype=torch.float32
+        )
+        batch_size = baseline_scores.shape[0]
+        jf = calibration_scores.reshape(batch_size, num_samples).mean(dim=1)
+
+        uids = batch.non_tensor_batch["uid"]
+        uid_to_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid_to_scores[uid].append(baseline_scores[idx])
+        j0 = torch.stack([torch.stack(uid_to_scores[uid]).mean() for uid in uids])
+
+        gap = reward_upper_bound - j0
+        raw_u = torch.where(gap > eps, (jf - j0) / gap.clamp(min=eps), torch.zeros_like(j0))
+        u = raw_u.clamp(min=0.0, max=1.0)
+        target_mask = self_distillation_batch.batch["self_distillation_mask"].to(device=u.device, dtype=u.dtype)
+        u = u * target_mask
+
+        metrics = {
+            "self_distillation/uplift_j0_mean": j0.mean().item(),
+            "self_distillation/uplift_jf_mean": jf.mean().item(),
+            "self_distillation/uplift_raw_mean": raw_u.mean().item(),
+            "self_distillation/uplift_weight_mean": u.mean().item(),
+            "self_distillation/uplift_weight_positive_fraction": (u > 0).float().mean().item(),
+            "self_distillation/uplift_num_samples": num_samples,
+        }
+        return DataProto.from_dict(tensors={"self_distillation_u": u}), metrics
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid", "raw_prompt"}) & batch.non_tensor_batch.keys()
@@ -1787,6 +1906,23 @@ class RayPPOTrainer:
                         self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)
                         if self_distillation_data is not None:
                             self_distillation_batch, self_distillation_metrics = self_distillation_data
+                            uplift_cfg = self.config.actor_rollout_ref.actor.self_distillation.get("uplift_calibration", {})
+                            if uplift_cfg.get("enable", False):
+                                uplift_batch, uplift_metrics = self._compute_self_distillation_uplift_weights(
+                                    batch=batch,
+                                    self_distillation_batch=self_distillation_batch,
+                                    reward_tensor=reward_tensor,
+                                    timing_raw=timing_raw,
+                                )
+                                self_distillation_batch = self_distillation_batch.union(uplift_batch)
+                                self_distillation_batch.pop(
+                                    batch_keys=[
+                                        "teacher_prompt_input_ids",
+                                        "teacher_prompt_attention_mask",
+                                        "teacher_prompt_position_ids",
+                                    ]
+                                )
+                                self_distillation_metrics.update(uplift_metrics)
                             batch = batch.union(self_distillation_batch)
                             metrics.update(self_distillation_metrics)
 
