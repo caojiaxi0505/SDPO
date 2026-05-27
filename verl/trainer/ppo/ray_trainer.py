@@ -816,12 +816,18 @@ class RayPPOTrainer:
         num_samples = int(uplift_cfg.get("num_samples", 1))
         reward_upper_bound = float(uplift_cfg.get("reward_upper_bound", 1.0))
         eps = float(uplift_cfg.get("eps", 1e-6))
+        aggregation = str(uplift_cfg.get("aggregation", "uid"))
         if num_samples <= 0:
             raise ValueError("self_distillation.uplift_calibration.num_samples must be positive")
         if reward_upper_bound <= 0:
             raise ValueError("self_distillation.uplift_calibration.reward_upper_bound must be positive")
         if eps <= 0:
             raise ValueError("self_distillation.uplift_calibration.eps must be positive")
+        if aggregation not in {"sample", "uid"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.aggregation must be one of "
+                f"{{'sample', 'uid'}}, got {aggregation!r}"
+            )
 
         prompt_keys = {
             "teacher_prompt_input_ids",
@@ -890,7 +896,7 @@ class RayPPOTrainer:
             device=baseline_scores.device, dtype=torch.float32
         )
         batch_size = baseline_scores.shape[0]
-        jf = calibration_scores.reshape(batch_size, num_samples).mean(dim=1)
+        calibration_scores = calibration_scores.reshape(batch_size, num_samples)
 
         uids = batch.non_tensor_batch["uid"]
         uid_to_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
@@ -898,10 +904,37 @@ class RayPPOTrainer:
             uid_to_scores[uid].append(baseline_scores[idx])
         j0 = torch.stack([torch.stack(uid_to_scores[uid]).mean() for uid in uids])
 
+        target_mask = self_distillation_batch.batch["self_distillation_mask"].to(device=baseline_scores.device)
+        if aggregation == "uid":
+            # Estimate the teacher-conditioned value at the prompt/group level:
+            #   J_f(x) = mean rewards of teacher-conditioned rollouts from all
+            #            distillation-active trajectories sharing the same uid.
+            # This avoids turning binary rewards with num_samples=1 into a noisy
+            # per-trajectory hard gate.
+            target_mask_cpu = target_mask.detach().cpu().bool().tolist()
+            uid_to_calibration_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
+            for idx, uid in enumerate(uids):
+                if target_mask_cpu[idx]:
+                    uid_to_calibration_scores[uid].append(calibration_scores[idx])
+
+            uid_to_j0 = {uid: torch.stack(scores).mean() for uid, scores in uid_to_scores.items()}
+            uid_to_jf = {}
+            for uid in uid_to_scores:
+                if len(uid_to_calibration_scores[uid]) > 0:
+                    uid_to_jf[uid] = torch.stack(uid_to_calibration_scores[uid]).mean()
+                else:
+                    # No teacher-conditioned target exists for this prompt; keep
+                    # J_f = J_0 so the resulting uplift weight is exactly zero.
+                    uid_to_jf[uid] = uid_to_j0[uid]
+            jf = torch.stack([uid_to_jf[uid] for uid in uids])
+        else:
+            # Backward-compatible per-trajectory estimate.
+            jf = calibration_scores.mean(dim=1)
+
         gap = reward_upper_bound - j0
         raw_u = torch.where(gap > eps, (jf - j0) / gap.clamp(min=eps), torch.zeros_like(j0))
         u = raw_u.clamp(min=0.0, max=1.0)
-        target_mask = self_distillation_batch.batch["self_distillation_mask"].to(device=u.device, dtype=u.dtype)
+        target_mask = target_mask.to(device=u.device, dtype=u.dtype)
         u = u * target_mask
 
         metrics = {
@@ -911,6 +944,7 @@ class RayPPOTrainer:
             "self_distillation/uplift_weight_mean": u.mean().item(),
             "self_distillation/uplift_weight_positive_fraction": (u > 0).float().mean().item(),
             "self_distillation/uplift_num_samples": num_samples,
+            "self_distillation/uplift_aggregation_uid": float(aggregation == "uid"),
         }
         return DataProto.from_dict(tensors={"self_distillation_u": u}), metrics
 

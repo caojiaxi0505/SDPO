@@ -95,6 +95,7 @@ class SelfDistillationConfig(BaseConfig):
         default_factory=lambda: {
             "enable": False,
             "num_samples": 1,
+            "aggregation": "uid",
             "reward_upper_bound": 1.0,
             "eps": 1e-6,
         }
@@ -125,6 +126,10 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError("self_distillation.uplift_calibration.reward_upper_bound must be positive")
         if self.uplift_calibration.get("eps", 1e-6) <= 0:
             raise ValueError("self_distillation.uplift_calibration.eps must be positive")
+        if self.uplift_calibration.get("aggregation", "uid") not in {"sample", "uid"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.aggregation must be one of {'sample', 'uid'}"
+            )
 
 
 @dataclass

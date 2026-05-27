@@ -132,6 +132,10 @@ self_distillation:
   uplift_calibration:
     enable: False
     num_samples: 1
+    # "uid" estimates J_f at the prompt/group level and broadcasts one uplift
+    # weight to trajectories sharing the same uid. "sample" keeps the previous
+    # per-trajectory estimate.
+    aggregation: uid
     reward_upper_bound: 1.0
     eps: 1e-6
 

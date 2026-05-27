@@ -1,10 +1,10 @@
 cd /cfs_turbo/jiaxicao/OPSD
-export TENSORBOARD_DIR=/cfs_turbo/jiaxicao/tensorboard/ucsdpo-tooluse-qwen3-8b-h20
-export ROLLOUT_DIR=/cfs_turbo/jiaxicao/rollouts/ucsdpo-tooluse-qwen3-8b-h20
+export TENSORBOARD_DIR=/cfs_turbo/jiaxicao/tensorboard/ucsdpo-tooluse-qwen3-8b-h20-260527
+export ROLLOUT_DIR=/cfs_turbo/jiaxicao/rollouts/ucsdpo-tooluse-qwen3-8b-h20-260527
 export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 bash training/verl_training.sh \
-  ucsdpo-tooluse-qwen3-8b-h20 \
+  ucsdpo-tooluse-qwen3-8b-h20-260527 \
   sdpo \
   datasets/tooluse \
   vars.dir=/cfs_turbo/jiaxicao/OPSD \
@@ -25,13 +25,14 @@ bash training/verl_training.sh \
   actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
   actor_rollout_ref.actor.self_distillation.uplift_calibration.enable=True \
   actor_rollout_ref.actor.self_distillation.uplift_calibration.num_samples=1 \
+  actor_rollout_ref.actor.self_distillation.uplift_calibration.aggregation=uid \
   actor_rollout_ref.actor.self_distillation.uplift_calibration.reward_upper_bound=1.0 \
   algorithm.rollout_correction.rollout_is=token \
   trainer.total_epochs=5 \
   trainer.test_freq=5 \
   trainer.save_freq=1000000 \
-  trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/ucsdpo-tooluse-qwen3-8b-h20 \
+  trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/ucsdpo-tooluse-qwen3-8b-h20-260527 \
   trainer.rollout_data_dir=${ROLLOUT_DIR}/train \
   trainer.validation_data_dir=${ROLLOUT_DIR}/val \
   'trainer.logger=["console","tensorboard"]' \
-  2>&1 | tee /cfs_turbo/jiaxicao/logs/ucsdpo/ucsdpo-tooluse-qwen3-8b-h20.log
+  2>&1 | tee /cfs_turbo/jiaxicao/logs/ucsdpo/ucsdpo-tooluse-qwen3-8b-h20-260527.log

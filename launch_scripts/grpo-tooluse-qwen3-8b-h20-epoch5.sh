@@ -1,5 +1,6 @@
 cd /cfs_turbo/jiaxicao/OPSD
 export TENSORBOARD_DIR=/cfs_turbo/jiaxicao/tensorboard/grpo-tooluse-qwen3-8b-h20
+export ROLLOUT_DIR=/cfs_turbo/jiaxicao/rollouts/grpo-tooluse-qwen3-8b-h20
 export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 bash training/verl_training.sh \
@@ -22,4 +23,6 @@ bash training/verl_training.sh \
   trainer.test_freq=5 \
   trainer.save_freq=1000000 \
   trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/grpo-tooluse-qwen3-8b-h20 \
+  trainer.rollout_data_dir=${ROLLOUT_DIR}/train \
+  trainer.validation_data_dir=${ROLLOUT_DIR}/val \
   'trainer.logger=["console","tensorboard"]'
