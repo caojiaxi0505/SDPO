@@ -802,6 +802,10 @@ class RayPPOTrainer:
                 "teacher_prompt_attention_mask": teacher_prompt_attention_mask,
                 "teacher_prompt_position_ids": compute_position_id_with_mask(teacher_prompt_attention_mask),
             })
+            return DataProto.from_dict(
+                tensors=tensors,
+                non_tensors={"teacher_raw_prompt": np.array(messages, dtype=object)},
+            ), metrics
         return DataProto.from_dict(tensors=tensors), metrics
 
     def _compute_self_distillation_uplift_weights(
@@ -829,16 +833,18 @@ class RayPPOTrainer:
                 "self_distillation.uplift_calibration.aggregation must be one of "
                 f"{{'sample', 'uid'}}, got {aggregation!r}"
             )
-        if jf_policy not in {"actor", "ema_teacher_fsdp"}:
+        if jf_policy not in {"actor", "ema_teacher_fsdp", "ema_teacher_vllm"}:
             raise ValueError(
                 "self_distillation.uplift_calibration.jf_policy must be one of "
-                f"{{'actor', 'ema_teacher_fsdp'}}, got {jf_policy!r}"
+                f"{{'actor', 'ema_teacher_fsdp', 'ema_teacher_vllm'}}, got {jf_policy!r}"
             )
         if (
-            jf_policy == "ema_teacher_fsdp"
+            jf_policy in {"ema_teacher_fsdp", "ema_teacher_vllm"}
             and self_distillation_cfg.get("teacher_regularization", "ema") != "ema"
         ):
-            raise ValueError("jf_policy='ema_teacher_fsdp' requires self_distillation.teacher_regularization='ema'.")
+            raise ValueError(
+                f"jf_policy={jf_policy!r} requires self_distillation.teacher_regularization='ema'."
+            )
 
         prompt_keys = {
             "teacher_prompt_input_ids",
@@ -848,6 +854,13 @@ class RayPPOTrainer:
         missing_prompt_keys = prompt_keys - set(self_distillation_batch.batch.keys())
         if missing_prompt_keys:
             raise ValueError(f"Missing uplift calibration prompt keys: {missing_prompt_keys}")
+        if "teacher_raw_prompt" not in self_distillation_batch.non_tensor_batch:
+            raise ValueError("Missing uplift calibration non-tensor key: teacher_raw_prompt")
+
+        calibration_meta_info = {
+            "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            "global_steps": self.global_steps,
+        }
 
         calibration_prompts = DataProto.from_dict(
             tensors={
@@ -855,11 +868,11 @@ class RayPPOTrainer:
                 "attention_mask": self_distillation_batch.batch["teacher_prompt_attention_mask"],
                 "position_ids": self_distillation_batch.batch["teacher_prompt_position_ids"],
             },
-            non_tensors={k: v.copy() for k, v in batch.non_tensor_batch.items()},
-            meta_info={
-                "temperature": self.config.actor_rollout_ref.rollout.temperature,
-                "global_steps": self.global_steps,
+            non_tensors={
+                **{k: v.copy() for k, v in batch.non_tensor_batch.items()},
+                "raw_prompt": self_distillation_batch.non_tensor_batch["teacher_raw_prompt"].copy(),
             },
+            meta_info=calibration_meta_info,
         )
         calibration_prompts = calibration_prompts.repeat(repeat_times=num_samples, interleave=True)
 
@@ -877,6 +890,16 @@ class RayPPOTrainer:
                 calibration_output_padded = self.actor_rollout_wg.generate_teacher_sequences(
                     calibration_prompts_padded
                 )
+            elif jf_policy == "ema_teacher_vllm":
+                if not self.async_rollout_mode:
+                    raise ValueError("jf_policy='ema_teacher_vllm' requires async rollout mode.")
+                self.actor_rollout_wg.set_rollout_weight_source("ema_teacher")
+                try:
+                    calibration_output_padded = self.async_rollout_manager.generate_sequences_from_tokens(
+                        calibration_prompts_padded
+                    )
+                finally:
+                    self.actor_rollout_wg.set_rollout_weight_source("actor")
             elif not self.async_rollout_mode:
                 calibration_output_padded = self.actor_rollout_wg.generate_sequences(calibration_prompts_padded)
             else:
@@ -965,6 +988,7 @@ class RayPPOTrainer:
             "self_distillation/uplift_aggregation_uid": float(aggregation == "uid"),
             "self_distillation/uplift_jf_policy_actor": float(jf_policy == "actor"),
             "self_distillation/uplift_jf_policy_ema_teacher_fsdp": float(jf_policy == "ema_teacher_fsdp"),
+            "self_distillation/uplift_jf_policy_ema_teacher_vllm": float(jf_policy == "ema_teacher_vllm"),
         }
         return DataProto.from_dict(tensors={"self_distillation_u": u}), metrics
 
@@ -1974,7 +1998,8 @@ class RayPPOTrainer:
                                         "teacher_prompt_input_ids",
                                         "teacher_prompt_attention_mask",
                                         "teacher_prompt_position_ids",
-                                    ]
+                                    ],
+                                    non_tensor_batch_keys=["teacher_raw_prompt"],
                                 )
                                 self_distillation_metrics.update(uplift_metrics)
                             batch = batch.union(self_distillation_batch)

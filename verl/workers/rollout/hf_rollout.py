@@ -56,8 +56,9 @@ class HFRollout(BaseRollout):
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
-        batch_prompts = prompts.chunk(chunks=num_chunks)
+        micro_batch_size = int(prompts.meta_info.get("micro_batch_size", self.config.get("micro_batch_size", batch_size)))
+        micro_batch_size = max(micro_batch_size, 1)
+        batch_prompts = prompts.split(split_size=micro_batch_size)
         output = [self._generate_minibatch(p) for p in batch_prompts]
         output = DataProto.concat(output)
         return output

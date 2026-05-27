@@ -41,6 +41,7 @@ from verl.utils.chat_template import initialize_system_prompt
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
@@ -480,6 +481,102 @@ class AgentLoopWorker:
         output = self._postprocess(outputs)
 
         return output
+
+    @tqbridge()
+    async def generate_sequences_from_tokens(self, batch: DataProto) -> DataProto:
+        """Generate from already-tokenized prompts through the async rollout servers.
+
+        This is intentionally narrower than the generic AgentLoop path: it does
+        not re-apply a chat template or tool schema. UC-SDPO uses it to estimate
+        J_f from the exact teacher-conditioned prompt tensors that also define
+        the SDPO distillation target.
+        """
+        config = self.config.actor_rollout_ref.rollout
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+            max_tokens=int(batch.meta_info.get("response_length", config.response_length)),
+        )
+
+        prompt_ids = batch.batch["input_ids"].cpu()
+        prompt_attention_mask = batch.batch["attention_mask"].cpu()
+
+        tasks = [
+            asyncio.create_task(
+                self._run_token_prompt_generation(
+                    prompt_ids=prompt_ids[i],
+                    prompt_attention_mask=prompt_attention_mask[i],
+                    sampling_params=sampling_params,
+                )
+            )
+            for i in range(len(batch))
+        ]
+        outputs = await asyncio.gather(*tasks)
+        return self._postprocess(outputs)
+
+    async def _run_token_prompt_generation(
+        self,
+        *,
+        prompt_ids: torch.Tensor,
+        prompt_attention_mask: torch.Tensor,
+        sampling_params: dict[str, Any],
+    ) -> _InternalAgentLoopOutput:
+        prompt_ids = prompt_ids.to(dtype=torch.long)
+        prompt_attention_mask = prompt_attention_mask.to(dtype=torch.long)
+        unpadded_prompt_ids = prompt_ids[prompt_attention_mask.bool()].tolist()
+        response_length = self.config.actor_rollout_ref.rollout.response_length
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        metrics = {}
+        with simple_timer("generate_sequences", metrics):
+            output = await self.server_manager.generate(
+                request_id=uuid4().hex,
+                prompt_ids=unpadded_prompt_ids,
+                sampling_params=dict(sampling_params),
+            )
+
+        response_ids = output.token_ids[:response_length]
+        response_len = len(response_ids)
+        response_tensor = torch.full((1, response_length), pad_token_id, dtype=torch.long)
+        response_attention_mask = torch.zeros((1, response_length), dtype=prompt_attention_mask.dtype)
+        response_mask = torch.zeros((1, response_length), dtype=prompt_attention_mask.dtype)
+        if response_len > 0:
+            response_tensor[0, :response_len] = torch.tensor(response_ids, dtype=torch.long)
+            response_attention_mask[0, :response_len] = 1
+            response_mask[0, :response_len] = 1
+
+        response_logprobs = None
+        if output.log_probs is not None:
+            logprobs = output.log_probs[:response_length]
+            pad_size = response_length - len(logprobs)
+            response_logprobs = torch.tensor(logprobs + [0.0] * pad_size, dtype=torch.float32).unsqueeze(0)
+
+        prompt_tensor = prompt_ids.unsqueeze(0)
+        prompt_attention_mask = prompt_attention_mask.unsqueeze(0)
+        input_ids = torch.cat([prompt_tensor, response_tensor], dim=1)
+        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        return _InternalAgentLoopOutput(
+            prompt_ids=prompt_tensor,
+            response_ids=response_tensor,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            response_mask=response_mask,
+            attention_mask=attention_mask,
+            response_logprobs=response_logprobs,
+            routed_experts=None,
+            multi_modal_inputs={},
+            multi_modal_data={},
+            reward_score=None,
+            num_turns=1,
+            metrics=AgentLoopMetrics(**metrics),
+            extra_fields={},
+        )
 
     async def _run_agent_loop(
         self,
@@ -954,6 +1051,32 @@ class AgentLoopManager:
 
         # calculate performance metrics
         metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+        timing = self._performance_metrics(metrics, output)
+
+        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        return output
+
+    def generate_sequences_from_tokens(self, prompts: DataProto) -> DataProto:
+        """Generate from tokenized prompts without re-tokenizing raw messages.
+
+        Used by UC-SDPO J_f calibration, where the conditioning context must be
+        exactly the teacher prompt tensor constructed by the trainer.
+        """
+
+        self.wake_up()
+        try:
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
+            outputs = ray.get(
+                [
+                    worker.generate_sequences_from_tokens.remote(chunk)
+                    for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                ]
+            )
+            output = DataProto.concat(outputs)
+        finally:
+            self.sleep()
+
+        metrics = [output.meta_info.pop("metrics") for output in outputs]
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}

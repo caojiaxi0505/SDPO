@@ -131,10 +131,14 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError(
                 "self_distillation.uplift_calibration.aggregation must be one of {'sample', 'uid'}"
             )
-        if self.uplift_calibration.get("jf_policy", "actor") not in {"actor", "ema_teacher_fsdp"}:
+        if self.uplift_calibration.get("jf_policy", "actor") not in {
+            "actor",
+            "ema_teacher_fsdp",
+            "ema_teacher_vllm",
+        }:
             raise ValueError(
                 "self_distillation.uplift_calibration.jf_policy must be one of "
-                "{'actor', 'ema_teacher_fsdp'}"
+                "{'actor', 'ema_teacher_fsdp', 'ema_teacher_vllm'}"
             )
 
 
