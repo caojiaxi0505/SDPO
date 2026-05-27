@@ -30,7 +30,8 @@ bash training/verl_training.sh \
   algorithm.rollout_correction.rollout_is=token \
   trainer.total_epochs=5 \
   trainer.test_freq=5 \
-  trainer.save_freq=1000000 \
+  trainer.save_freq=50 \
+  trainer.max_actor_ckpt_to_keep=20 \
   trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/ucsdpo-tooluse-qwen3-8b-h20-260527 \
   trainer.rollout_data_dir=${ROLLOUT_DIR}/train \
   trainer.validation_data_dir=${ROLLOUT_DIR}/val \
