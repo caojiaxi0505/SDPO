@@ -38,9 +38,21 @@ __all__ = ["HFRollout"]
 
 class HFRollout(BaseRollout):
     def __init__(self, module: nn.Module, config):
-        super().__init__()
+        # HFRollout is a lightweight legacy helper that directly wraps an
+        # in-process HF/FSDP module. It does not own an external inference
+        # engine, so it intentionally does not call BaseRollout.__init__, whose
+        # current signature is for server-backed rollout engines.
         self.config = config
         self.module = module
+
+    async def resume(self, tags: list[str]):
+        return None
+
+    async def update_weights(self, weights, **kwargs):
+        return None
+
+    async def release(self):
+        return None
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
