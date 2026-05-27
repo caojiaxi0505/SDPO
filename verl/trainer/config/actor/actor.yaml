@@ -131,6 +131,10 @@ self_distillation:
   # Disabled by default to preserve the original SDPO behavior.
   uplift_calibration:
     enable: False
+    # Which policy estimates J_f under the teacher-conditioned prompt.
+    # "actor" preserves the low-cost proxy used by the rollout engine.
+    # "ema_teacher_fsdp" uses the EMA teacher module directly via FSDP/HF generation.
+    jf_policy: actor
     num_samples: 1
     # "uid" estimates J_f at the prompt/group level and broadcasts one uplift
     # weight to trajectories sharing the same uid. "sample" keeps the previous

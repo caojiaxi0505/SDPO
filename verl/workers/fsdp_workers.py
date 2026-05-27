@@ -1024,6 +1024,67 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="teacher_generate")
+    def generate_teacher_sequences(self, prompts: DataProto):
+        """Generate sequences from the EMA teacher module for UC-SDPO J_f estimation.
+
+        This intentionally uses a simple FSDP/HF generation path rather than the
+        optimized rollout engine. It is meant for correctness-first experiments:
+        J_f should be estimated from the same EMA teacher that provides SDPO's
+        distillation target.
+        """
+        assert self._is_actor
+        if not hasattr(self, "actor") or self.actor.teacher_module is None:
+            raise ValueError("EMA teacher rollout requires actor.teacher_module to be initialized.")
+
+        from verl.workers.rollout.hf_rollout import HFRollout
+
+        prompts = prompts.to(get_device_id())
+
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+            if self.generation_config is not None
+            else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+
+        # Keep teacher sampling RNG separate from the training RNG so the
+        # calibration rollout does not perturb subsequent actor updates.
+        if not hasattr(self, "teacher_gen_random_states"):
+            self.teacher_gen_random_states = get_torch_device().get_rng_state()
+        trainer_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.teacher_gen_random_states)
+
+        timing_generate = {}
+        try:
+            teacher_rollout = HFRollout(module=self.actor.teacher_module, config=self.config.rollout)
+            with simple_timer("generate_teacher_sequences", timing_generate):
+                output = teacher_rollout.generate_sequences(prompts=prompts)
+            self.teacher_gen_random_states = get_torch_device().get_rng_state()
+        finally:
+            get_torch_device().set_rng_state(trainer_random_states)
+
+        timing_generate_topk_ratio, timing_generate_min, timing_generate_max = topk_reduce_ratio_min_max(
+            timing_generate["generate_teacher_sequences"]
+        )
+        timing_generate = reduce_timing(timing_generate)
+        timing_generate.update(
+            {
+                "teacher_generation_timing/max": timing_generate_max,
+                "teacher_generation_timing/min": timing_generate_min,
+                "teacher_generation_timing/topk_ratio": timing_generate_topk_ratio,
+            }
+        )
+        output.meta_info["timing"] = timing_generate
+        output = output.to("cpu")
+
+        get_torch_device().empty_cache()
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob

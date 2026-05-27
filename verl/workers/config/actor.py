@@ -94,6 +94,7 @@ class SelfDistillationConfig(BaseConfig):
     uplift_calibration: dict[str, Any] = field(
         default_factory=lambda: {
             "enable": False,
+            "jf_policy": "actor",
             "num_samples": 1,
             "aggregation": "uid",
             "reward_upper_bound": 1.0,
@@ -129,6 +130,11 @@ class SelfDistillationConfig(BaseConfig):
         if self.uplift_calibration.get("aggregation", "uid") not in {"sample", "uid"}:
             raise ValueError(
                 "self_distillation.uplift_calibration.aggregation must be one of {'sample', 'uid'}"
+            )
+        if self.uplift_calibration.get("jf_policy", "actor") not in {"actor", "ema_teacher_fsdp"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.jf_policy must be one of "
+                "{'actor', 'ema_teacher_fsdp'}"
             )
 
 

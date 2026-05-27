@@ -817,6 +817,7 @@ class RayPPOTrainer:
         reward_upper_bound = float(uplift_cfg.get("reward_upper_bound", 1.0))
         eps = float(uplift_cfg.get("eps", 1e-6))
         aggregation = str(uplift_cfg.get("aggregation", "uid"))
+        jf_policy = str(uplift_cfg.get("jf_policy", "actor"))
         if num_samples <= 0:
             raise ValueError("self_distillation.uplift_calibration.num_samples must be positive")
         if reward_upper_bound <= 0:
@@ -828,6 +829,16 @@ class RayPPOTrainer:
                 "self_distillation.uplift_calibration.aggregation must be one of "
                 f"{{'sample', 'uid'}}, got {aggregation!r}"
             )
+        if jf_policy not in {"actor", "ema_teacher_fsdp"}:
+            raise ValueError(
+                "self_distillation.uplift_calibration.jf_policy must be one of "
+                f"{{'actor', 'ema_teacher_fsdp'}}, got {jf_policy!r}"
+            )
+        if (
+            jf_policy == "ema_teacher_fsdp"
+            and self_distillation_cfg.get("teacher_regularization", "ema") != "ema"
+        ):
+            raise ValueError("jf_policy='ema_teacher_fsdp' requires self_distillation.teacher_regularization='ema'.")
 
         prompt_keys = {
             "teacher_prompt_input_ids",
@@ -852,14 +863,21 @@ class RayPPOTrainer:
         )
         calibration_prompts = calibration_prompts.repeat(repeat_times=num_samples, interleave=True)
 
-        size_divisor = (
-            self.actor_rollout_wg.world_size
-            if not self.async_rollout_mode
-            else self.config.actor_rollout_ref.rollout.agent.num_workers
-        )
+        if jf_policy == "ema_teacher_fsdp":
+            size_divisor = self.actor_rollout_wg.world_size
+        else:
+            size_divisor = (
+                self.actor_rollout_wg.world_size
+                if not self.async_rollout_mode
+                else self.config.actor_rollout_ref.rollout.agent.num_workers
+            )
         calibration_prompts_padded, pad_size = pad_dataproto_to_divisor(calibration_prompts, size_divisor)
         with marked_timer("self_distillation_uplift_gen", timing_raw, color="red"):
-            if not self.async_rollout_mode:
+            if jf_policy == "ema_teacher_fsdp":
+                calibration_output_padded = self.actor_rollout_wg.generate_teacher_sequences(
+                    calibration_prompts_padded
+                )
+            elif not self.async_rollout_mode:
                 calibration_output_padded = self.actor_rollout_wg.generate_sequences(calibration_prompts_padded)
             else:
                 calibration_output_padded = self.async_rollout_manager.generate_sequences(calibration_prompts_padded)
@@ -945,6 +963,8 @@ class RayPPOTrainer:
             "self_distillation/uplift_weight_positive_fraction": (u > 0).float().mean().item(),
             "self_distillation/uplift_num_samples": num_samples,
             "self_distillation/uplift_aggregation_uid": float(aggregation == "uid"),
+            "self_distillation/uplift_jf_policy_actor": float(jf_policy == "actor"),
+            "self_distillation/uplift_jf_policy_ema_teacher_fsdp": float(jf_policy == "ema_teacher_fsdp"),
         }
         return DataProto.from_dict(tensors={"self_distillation_u": u}), metrics
 
