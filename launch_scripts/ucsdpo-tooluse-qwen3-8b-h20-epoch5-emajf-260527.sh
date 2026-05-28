@@ -1,10 +1,10 @@
 cd /cfs_turbo/jiaxicao/OPSD
-export TENSORBOARD_DIR=/cfs_turbo/jiaxicao/tensorboard/ucsdpo-tooluse-qwen3-8b-h20-260527
-export ROLLOUT_DIR=/cfs_turbo/jiaxicao/rollouts/ucsdpo-tooluse-qwen3-8b-h20-260527
+export TENSORBOARD_DIR=/cfs_turbo/jiaxicao/tensorboard/ucsdpo-tooluse-qwen3-8b-emajf-h20-260527
+export ROLLOUT_DIR=/cfs_turbo/jiaxicao/rollouts/ucsdpo-tooluse-qwen3-8b-emajf-h20-260527
 export TOKENIZERS_PARALLELISM=false
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 bash training/verl_training.sh \
-  ucsdpo-tooluse-qwen3-8b-h20-260527 \
+  ucsdpo-tooluse-qwen3-8b-emajf-h20-260527 \
   sdpo \
   datasets/tooluse \
   vars.dir=/cfs_turbo/jiaxicao/OPSD \
@@ -33,8 +33,8 @@ bash training/verl_training.sh \
   trainer.test_freq=5 \
   trainer.save_freq=50 \
   trainer.max_actor_ckpt_to_keep=20 \
-  trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/ucsdpo-tooluse-qwen3-8b-h20-260527 \
+  trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/ucsdpo-tooluse-qwen3-8b-emajf-h20-260527 \
   trainer.rollout_data_dir=${ROLLOUT_DIR}/train \
   trainer.validation_data_dir=${ROLLOUT_DIR}/val \
   'trainer.logger=["console","tensorboard"]' \
-  2>&1 | tee /cfs_turbo/jiaxicao/logs/ucsdpo/ucsdpo-tooluse-qwen3-8b-h20-260527.log
+  2>&1 | tee /cfs_turbo/jiaxicao/logs/ucsdpo/ucsdpo-tooluse-qwen3-8b-emajf-h20-260527.log
