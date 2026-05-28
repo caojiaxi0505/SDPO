@@ -59,6 +59,7 @@ class SelfDistillationConfig(BaseConfig):
         include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
         uplift_calibration (dict[str, Any]): Optional reward-uplift calibration for scaling the distillation loss.
+            Set solution_level_jf.enable=True or aggregation="solution" to estimate J_f per prompt+teacher context.
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
     """
@@ -97,6 +98,10 @@ class SelfDistillationConfig(BaseConfig):
             "jf_policy": "actor",
             "num_samples": 1,
             "aggregation": "uid",
+            "solution_level_jf": {
+                "enable": False,
+                "num_samples": 1,
+            },
             "reward_upper_bound": 1.0,
             "eps": 1e-6,
         }
@@ -127,10 +132,19 @@ class SelfDistillationConfig(BaseConfig):
             raise ValueError("self_distillation.uplift_calibration.reward_upper_bound must be positive")
         if self.uplift_calibration.get("eps", 1e-6) <= 0:
             raise ValueError("self_distillation.uplift_calibration.eps must be positive")
-        if self.uplift_calibration.get("aggregation", "uid") not in {"sample", "uid"}:
+        if self.uplift_calibration.get("aggregation", "uid") not in {"sample", "uid", "solution"}:
             raise ValueError(
-                "self_distillation.uplift_calibration.aggregation must be one of {'sample', 'uid'}"
+                "self_distillation.uplift_calibration.aggregation must be one of {'sample', 'uid', 'solution'}"
             )
+        solution_level_jf = self.uplift_calibration.get("solution_level_jf", {})
+        if isinstance(solution_level_jf, bool):
+            solution_level_num_samples = self.uplift_calibration.get("num_samples", 1)
+        else:
+            solution_level_num_samples = solution_level_jf.get(
+                "num_samples", self.uplift_calibration.get("num_samples", 1)
+            )
+        if solution_level_num_samples <= 0:
+            raise ValueError("self_distillation.uplift_calibration.solution_level_jf.num_samples must be positive")
         if self.uplift_calibration.get("jf_policy", "actor") not in {
             "actor",
             "ema_teacher_fsdp",

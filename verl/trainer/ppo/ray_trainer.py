@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import os
 import re
@@ -797,6 +798,18 @@ class RayPPOTrainer:
         }
         if uplift_calibration_enabled:
             teacher_prompt_attention_mask = teacher_prompt["attention_mask"].to(device)
+            teacher_context_keys: list[str] = []
+            teacher_prompt_attention_mask_cpu = teacher_prompt["attention_mask"].bool().cpu()
+            teacher_prompt_input_ids_cpu = teacher_prompt["input_ids"].cpu()
+            for i in range(batch_size):
+                if solution_strs[i] is None and not feedback_used[i]:
+                    teacher_context_keys.append("")
+                    continue
+                unpadded_prompt_ids = teacher_prompt_input_ids_cpu[i][teacher_prompt_attention_mask_cpu[i]]
+                prompt_digest = hashlib.sha1(
+                    unpadded_prompt_ids.to(dtype=torch.long).numpy().astype(np.int64).tobytes()
+                ).hexdigest()
+                teacher_context_keys.append(f"{batch.non_tensor_batch['uid'][i]}:{prompt_digest}")
             tensors.update({
                 "teacher_prompt_input_ids": teacher_prompt["input_ids"].to(device),
                 "teacher_prompt_attention_mask": teacher_prompt_attention_mask,
@@ -804,7 +817,10 @@ class RayPPOTrainer:
             })
             return DataProto.from_dict(
                 tensors=tensors,
-                non_tensors={"teacher_raw_prompt": np.array(messages, dtype=object)},
+                non_tensors={
+                    "teacher_raw_prompt": np.array(messages, dtype=object),
+                    "teacher_context_key": np.array(teacher_context_keys, dtype=object),
+                },
             ), metrics
         return DataProto.from_dict(tensors=tensors), metrics
 
@@ -822,16 +838,30 @@ class RayPPOTrainer:
         eps = float(uplift_cfg.get("eps", 1e-6))
         aggregation = str(uplift_cfg.get("aggregation", "uid"))
         jf_policy = str(uplift_cfg.get("jf_policy", "actor"))
+        solution_level_jf_cfg = uplift_cfg.get("solution_level_jf", {})
+        if isinstance(solution_level_jf_cfg, bool):
+            solution_level_jf_enabled_from_cfg = bool(solution_level_jf_cfg)
+            solution_level_num_samples = num_samples
+        else:
+            solution_level_jf_enabled_from_cfg = bool(solution_level_jf_cfg.get("enable", False))
+            solution_level_num_samples = int(
+                solution_level_jf_cfg.get("num_samples", num_samples)
+                if solution_level_jf_enabled_from_cfg
+                else num_samples
+            )
+        solution_level_jf_enabled = solution_level_jf_enabled_from_cfg or aggregation == "solution"
         if num_samples <= 0:
             raise ValueError("self_distillation.uplift_calibration.num_samples must be positive")
+        if solution_level_num_samples <= 0:
+            raise ValueError("self_distillation.uplift_calibration.solution_level_jf.num_samples must be positive")
         if reward_upper_bound <= 0:
             raise ValueError("self_distillation.uplift_calibration.reward_upper_bound must be positive")
         if eps <= 0:
             raise ValueError("self_distillation.uplift_calibration.eps must be positive")
-        if aggregation not in {"sample", "uid"}:
+        if aggregation not in {"sample", "uid", "solution"}:
             raise ValueError(
                 "self_distillation.uplift_calibration.aggregation must be one of "
-                f"{{'sample', 'uid'}}, got {aggregation!r}"
+                f"{{'sample', 'uid', 'solution'}}, got {aggregation!r}"
             )
         if jf_policy not in {"actor", "ema_teacher_fsdp", "ema_teacher_vllm"}:
             raise ValueError(
@@ -856,13 +886,15 @@ class RayPPOTrainer:
             raise ValueError(f"Missing uplift calibration prompt keys: {missing_prompt_keys}")
         if "teacher_raw_prompt" not in self_distillation_batch.non_tensor_batch:
             raise ValueError("Missing uplift calibration non-tensor key: teacher_raw_prompt")
+        if solution_level_jf_enabled and "teacher_context_key" not in self_distillation_batch.non_tensor_batch:
+            raise ValueError("Missing uplift calibration non-tensor key: teacher_context_key")
 
         calibration_meta_info = {
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
             "global_steps": self.global_steps,
         }
 
-        calibration_prompts = DataProto.from_dict(
+        calibration_prompts_all = DataProto.from_dict(
             tensors={
                 "input_ids": self_distillation_batch.batch["teacher_prompt_input_ids"],
                 "attention_mask": self_distillation_batch.batch["teacher_prompt_attention_mask"],
@@ -874,7 +906,32 @@ class RayPPOTrainer:
             },
             meta_info=calibration_meta_info,
         )
-        calibration_prompts = calibration_prompts.repeat(repeat_times=num_samples, interleave=True)
+        target_mask = self_distillation_batch.batch["self_distillation_mask"]
+        target_mask_cpu = target_mask.detach().cpu().bool().tolist()
+        teacher_context_keys = None
+        unique_context_keys: list[str] = []
+        unique_context_indices: list[int] = []
+        if solution_level_jf_enabled:
+            teacher_context_keys = [
+                "" if key is None else str(key)
+                for key in self_distillation_batch.non_tensor_batch["teacher_context_key"]
+            ]
+            seen_context_keys: set[str] = set()
+            for idx, key in enumerate(teacher_context_keys):
+                if not target_mask_cpu[idx] or not key:
+                    continue
+                if key in seen_context_keys:
+                    continue
+                seen_context_keys.add(key)
+                unique_context_keys.append(key)
+                unique_context_indices.append(idx)
+            calibration_prompts = calibration_prompts_all.select_idxs(unique_context_indices)
+            effective_num_samples = solution_level_num_samples
+        else:
+            calibration_prompts = calibration_prompts_all
+            effective_num_samples = num_samples
+        calibration_base_size = len(calibration_prompts)
+        calibration_prompts = calibration_prompts.repeat(repeat_times=effective_num_samples, interleave=True)
 
         if jf_policy == "ema_teacher_fsdp":
             size_divisor = self.actor_rollout_wg.world_size
@@ -884,81 +941,94 @@ class RayPPOTrainer:
                 if not self.async_rollout_mode
                 else self.config.actor_rollout_ref.rollout.agent.num_workers
             )
-        calibration_prompts_padded, pad_size = pad_dataproto_to_divisor(calibration_prompts, size_divisor)
-        with marked_timer("self_distillation_uplift_gen", timing_raw, color="red"):
-            if jf_policy == "ema_teacher_fsdp":
-                calibration_output_padded = self.actor_rollout_wg.generate_teacher_sequences(
-                    calibration_prompts_padded
-                )
-            elif jf_policy == "ema_teacher_vllm":
-                if not self.async_rollout_mode:
-                    raise ValueError("jf_policy='ema_teacher_vllm' requires async rollout mode.")
-                self.actor_rollout_wg.set_rollout_weight_source("ema_teacher")
-                try:
-                    calibration_output_padded = self.async_rollout_manager.generate_sequences_from_tokens(
+        if calibration_base_size > 0:
+            calibration_prompts_padded, pad_size = pad_dataproto_to_divisor(calibration_prompts, size_divisor)
+            with marked_timer("self_distillation_uplift_gen", timing_raw, color="red"):
+                if jf_policy == "ema_teacher_fsdp":
+                    calibration_output_padded = self.actor_rollout_wg.generate_teacher_sequences(
                         calibration_prompts_padded
                     )
-                finally:
-                    self.actor_rollout_wg.set_rollout_weight_source("actor")
-            elif not self.async_rollout_mode:
-                calibration_output_padded = self.actor_rollout_wg.generate_sequences(calibration_prompts_padded)
-            else:
-                calibration_output_padded = self.async_rollout_manager.generate_sequences(calibration_prompts_padded)
-            uplift_timing = calibration_output_padded.meta_info.pop("timing", {})
-            timing_raw.update({f"self_distillation_uplift/{k}": v for k, v in uplift_timing.items()})
-        calibration_output = unpad_dataproto(calibration_output_padded, pad_size=pad_size)
+                elif jf_policy == "ema_teacher_vllm":
+                    if not self.async_rollout_mode:
+                        raise ValueError("jf_policy='ema_teacher_vllm' requires async rollout mode.")
+                    self.actor_rollout_wg.set_rollout_weight_source("ema_teacher")
+                    try:
+                        calibration_output_padded = self.async_rollout_manager.generate_sequences_from_tokens(
+                            calibration_prompts_padded
+                        )
+                    finally:
+                        self.actor_rollout_wg.set_rollout_weight_source("actor")
+                elif not self.async_rollout_mode:
+                    calibration_output_padded = self.actor_rollout_wg.generate_sequences(calibration_prompts_padded)
+                else:
+                    calibration_output_padded = self.async_rollout_manager.generate_sequences(calibration_prompts_padded)
+                uplift_timing = calibration_output_padded.meta_info.pop("timing", {})
+                timing_raw.update({f"self_distillation_uplift/{k}": v for k, v in uplift_timing.items()})
+            calibration_output = unpad_dataproto(calibration_output_padded, pad_size=pad_size)
 
-        reward_batch = DataProto(
-            batch=calibration_output.batch,
-            non_tensor_batch=calibration_prompts.non_tensor_batch,
-            meta_info=calibration_output.meta_info,
-        )
-        if self.use_rm and "rm_scores" not in reward_batch.batch.keys():
-            if not self.use_reward_loop:
-                rm_scores = self.rm_wg.compute_rm_score(reward_batch)
-            else:
-                assert self.reward_loop_manager is not None, "RewardLoopManager is None"
-                rm_scores = self.reward_loop_manager.compute_rm_score(reward_batch)
-            reward_batch = reward_batch.union(rm_scores)
+            reward_batch = DataProto(
+                batch=calibration_output.batch,
+                non_tensor_batch=calibration_prompts.non_tensor_batch,
+                meta_info=calibration_output.meta_info,
+            )
+            if self.use_rm and "rm_scores" not in reward_batch.batch.keys():
+                if not self.use_reward_loop:
+                    rm_scores = self.rm_wg.compute_rm_score(reward_batch)
+                else:
+                    assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+                    rm_scores = self.reward_loop_manager.compute_rm_score(reward_batch)
+                reward_batch = reward_batch.union(rm_scores)
 
-        with marked_timer("self_distillation_uplift_reward", timing_raw, color="yellow"):
-            if self.config.reward_model.launch_reward_fn_async:
-                future_reward = compute_reward_async.remote(
-                    data=reward_batch, config=self.config, tokenizer=self.tokenizer, reward_fn=self.reward_fn
-                )
-                calibration_reward_tensor, _ = ray.get(future_reward)
-            else:
-                calibration_reward_tensor, _ = self._compute_or_extract_reward(
-                    reward_batch, reward_fn=self.reward_fn, return_dict=False
-                )
+            with marked_timer("self_distillation_uplift_reward", timing_raw, color="yellow"):
+                if self.config.reward_model.launch_reward_fn_async:
+                    future_reward = compute_reward_async.remote(
+                        data=reward_batch, config=self.config, tokenizer=self.tokenizer, reward_fn=self.reward_fn
+                    )
+                    calibration_reward_tensor, _ = ray.get(future_reward)
+                else:
+                    calibration_reward_tensor, _ = self._compute_or_extract_reward(
+                        reward_batch, reward_fn=self.reward_fn, return_dict=False
+                    )
+
+            calibration_scores = calibration_reward_tensor.sum(dim=-1).detach().to(
+                device=reward_tensor.device, dtype=torch.float32
+            )
+            calibration_scores = calibration_scores.reshape(calibration_base_size, effective_num_samples)
+        else:
+            calibration_scores = None
 
         baseline_scores = reward_tensor.sum(dim=-1).detach().to(dtype=torch.float32)
-        calibration_scores = calibration_reward_tensor.sum(dim=-1).detach().to(
-            device=baseline_scores.device, dtype=torch.float32
-        )
-        batch_size = baseline_scores.shape[0]
-        calibration_scores = calibration_scores.reshape(batch_size, num_samples)
 
         uids = batch.non_tensor_batch["uid"]
         uid_to_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
         for idx, uid in enumerate(uids):
             uid_to_scores[uid].append(baseline_scores[idx])
-        j0 = torch.stack([torch.stack(uid_to_scores[uid]).mean() for uid in uids])
+        uid_to_j0 = {uid: torch.stack(scores).mean() for uid, scores in uid_to_scores.items()}
+        j0 = torch.stack([uid_to_j0[uid] for uid in uids])
 
-        target_mask = self_distillation_batch.batch["self_distillation_mask"].to(device=baseline_scores.device)
-        if aggregation == "uid":
+        if solution_level_jf_enabled:
+            context_to_jf: dict[str, torch.Tensor] = {}
+            if calibration_scores is not None:
+                for context_idx, key in enumerate(unique_context_keys):
+                    context_to_jf[key] = calibration_scores[context_idx].mean()
+            assert teacher_context_keys is not None
+            jf = torch.stack([
+                context_to_jf.get(teacher_context_keys[idx], uid_to_j0[uid])
+                if target_mask_cpu[idx]
+                else uid_to_j0[uid]
+                for idx, uid in enumerate(uids)
+            ])
+        elif aggregation == "uid":
             # Estimate the teacher-conditioned value at the prompt/group level:
             #   J_f(x) = mean rewards of teacher-conditioned rollouts from all
             #            distillation-active trajectories sharing the same uid.
             # This avoids turning binary rewards with num_samples=1 into a noisy
             # per-trajectory hard gate.
-            target_mask_cpu = target_mask.detach().cpu().bool().tolist()
             uid_to_calibration_scores: dict[Any, list[torch.Tensor]] = defaultdict(list)
             for idx, uid in enumerate(uids):
                 if target_mask_cpu[idx]:
                     uid_to_calibration_scores[uid].append(calibration_scores[idx])
 
-            uid_to_j0 = {uid: torch.stack(scores).mean() for uid, scores in uid_to_scores.items()}
             uid_to_jf = {}
             for uid in uid_to_scores:
                 if len(uid_to_calibration_scores[uid]) > 0:
@@ -978,14 +1048,31 @@ class RayPPOTrainer:
         target_mask = target_mask.to(device=u.device, dtype=u.dtype)
         u = u * target_mask
 
+        active_target_count = float(sum(target_mask_cpu))
+        unique_context_count = float(len(unique_context_keys)) if solution_level_jf_enabled else 0.0
+        context_reuse_mean = (
+            active_target_count / unique_context_count
+            if solution_level_jf_enabled and unique_context_count > 0
+            else 0.0
+        )
+
         metrics = {
             "self_distillation/uplift_j0_mean": j0.mean().item(),
             "self_distillation/uplift_jf_mean": jf.mean().item(),
             "self_distillation/uplift_raw_mean": raw_u.mean().item(),
             "self_distillation/uplift_weight_mean": u.mean().item(),
             "self_distillation/uplift_weight_positive_fraction": (u > 0).float().mean().item(),
-            "self_distillation/uplift_num_samples": num_samples,
-            "self_distillation/uplift_aggregation_uid": float(aggregation == "uid"),
+            "self_distillation/uplift_num_samples": effective_num_samples,
+            "self_distillation/uplift_solution_level_jf": float(solution_level_jf_enabled),
+            "self_distillation/uplift_unique_context_count": unique_context_count,
+            "self_distillation/uplift_context_reuse_mean": context_reuse_mean,
+            "self_distillation/uplift_aggregation_uid": float(
+                (not solution_level_jf_enabled) and aggregation == "uid"
+            ),
+            "self_distillation/uplift_aggregation_sample": float(
+                (not solution_level_jf_enabled) and aggregation == "sample"
+            ),
+            "self_distillation/uplift_aggregation_solution": float(solution_level_jf_enabled),
             "self_distillation/uplift_jf_policy_actor": float(jf_policy == "actor"),
             "self_distillation/uplift_jf_policy_ema_teacher_fsdp": float(jf_policy == "ema_teacher_fsdp"),
             "self_distillation/uplift_jf_policy_ema_teacher_vllm": float(jf_policy == "ema_teacher_vllm"),
@@ -1999,7 +2086,7 @@ class RayPPOTrainer:
                                         "teacher_prompt_attention_mask",
                                         "teacher_prompt_position_ids",
                                     ],
-                                    non_tensor_batch_keys=["teacher_raw_prompt"],
+                                    non_tensor_batch_keys=["teacher_raw_prompt", "teacher_context_key"],
                                 )
                                 self_distillation_metrics.update(uplift_metrics)
                             batch = batch.union(self_distillation_batch)

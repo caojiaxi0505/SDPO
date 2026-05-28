@@ -138,8 +138,16 @@ self_distillation:
     num_samples: 1
     # "uid" estimates J_f at the prompt/group level and broadcasts one uplift
     # weight to trajectories sharing the same uid. "sample" keeps the previous
-    # per-trajectory estimate.
+    # per-trajectory estimate. "solution" enables per prompt+teacher-context J_f.
     aggregation: uid
+    # Optional per prompt+successful-solution/context J_f estimation. Disabled by
+    # default to preserve the original uid aggregation behavior. When enabled,
+    # each unique active teacher-conditioned context is rolled out num_samples
+    # times and its J_f is broadcast only to samples using that same context.
+    # Alternatively, set aggregation=solution and use uplift_calibration.num_samples.
+    solution_level_jf:
+      enable: False
+      num_samples: 1
     reward_upper_bound: 1.0
     eps: 1e-6
 
