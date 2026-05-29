@@ -41,6 +41,9 @@ class SelfDistillationConfig(BaseConfig):
 
     Args:
         Distillation is enabled when policy_loss.loss_mode == "sdpo".
+        objective (str): "jsd" preserves original SDPO; "counterfactual_aux" adds privileged auxiliary loss.
+        auxiliary_coef (float): Coefficient for counterfactual auxiliary loss.
+        auxiliary_base_loss_mode (str): Base policy loss used by counterfactual auxiliary mode.
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
         alpha (float): KL interpolation coefficient. 0.0=forward KL, 1.0=reverse KL, in-between=JSD.
         success_reward_threshold (float): Minimum sequence reward to be considered successful.
@@ -52,6 +55,9 @@ class SelfDistillationConfig(BaseConfig):
         reprompt_truncation (str): Truncation method for the reprompted prompt (recommended to use "right" or "error").
         dont_reprompt_on_self_success (bool): Whether to not reprompt on self-success.
         remove_thinking_from_demonstration (bool): Whether to remove <think>...</think> tags from successful demonstrations before reprompting.
+        canonicalize_successful_solution (bool): Whether to canonicalize successful demonstrations when supported.
+        decision_token_mask (dict[str, Any]): Optional token-level mask settings for auxiliary distillation.
+        counterfactual (dict[str, Any]): Settings for the counterfactual auxiliary objective.
         is_clip (Optional[float]): Clip value for distillation IS ratio; None disables IS weighting.
         reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
         solution_template (str): Template for formatting solution section. Uses {successful_previous_attempt} placeholder.
@@ -64,6 +70,9 @@ class SelfDistillationConfig(BaseConfig):
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
     """
 
+    objective: str = "jsd"
+    auxiliary_coef: float = 0.2
+    auxiliary_base_loss_mode: str = "vanilla"
     full_logit_distillation: bool = True
     alpha: float = 0.0
     success_reward_threshold: float = 1.0
@@ -75,6 +84,19 @@ class SelfDistillationConfig(BaseConfig):
     reprompt_truncation: str = "right"
     dont_reprompt_on_self_success: bool = False
     remove_thinking_from_demonstration: bool = False
+    canonicalize_successful_solution: bool = False
+    decision_token_mask: dict[str, Any] = field(
+        default_factory=lambda: {
+            "enable": False,
+            "mode": "tooluse_action_span",
+        }
+    )
+    counterfactual: dict[str, Any] = field(
+        default_factory=lambda: {
+            "positive_only": False,
+            "delta_clip": 5.0,
+        }
+    )
     is_clip: Optional[float] = None
     reprompt_template: str = (
         "{prompt}{solution}{feedback}\n\n"
@@ -108,6 +130,17 @@ class SelfDistillationConfig(BaseConfig):
     )
 
     def __post_init__(self):
+        if self.objective not in {"jsd", "counterfactual_aux"}:
+            raise ValueError(
+                "self_distillation.objective must be one of {'jsd', 'counterfactual_aux'}, "
+                f"got {self.objective}"
+            )
+        if self.auxiliary_coef < 0:
+            raise ValueError(f"self_distillation.auxiliary_coef must be non-negative, got {self.auxiliary_coef}")
+        if self.counterfactual.get("delta_clip", 5.0) is not None and self.counterfactual.get("delta_clip", 5.0) <= 0:
+            raise ValueError("self_distillation.counterfactual.delta_clip must be positive or null")
+        if self.decision_token_mask.get("mode", "tooluse_action_span") not in {"tooluse_action_span"}:
+            raise ValueError("self_distillation.decision_token_mask.mode must be 'tooluse_action_span'")
         if not 0.0 <= self.alpha <= 1.0:
             raise ValueError(f"self_distillation.alpha must be in [0,1], got {self.alpha}")
         valid_teacher_regularization = ["ema", "trust-region"]

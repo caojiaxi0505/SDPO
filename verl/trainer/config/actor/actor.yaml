@@ -83,6 +83,17 @@ self_distillation:
 
   # Distillation is enabled when policy_loss.loss_mode == "sdpo"
 
+  # Self-distillation objective. "jsd" preserves the original SDPO behavior.
+  # "counterfactual_aux" keeps the GRPO/PPO policy loss as the main objective
+  # and adds a signed privileged-vs-baseline EMA teacher auxiliary loss.
+  objective: jsd
+
+  # Auxiliary coefficient for objective=counterfactual_aux.
+  auxiliary_coef: 0.2
+
+  # Base policy loss used by objective=counterfactual_aux.
+  auxiliary_base_loss_mode: vanilla
+
   # Whether to use full-logit KL distillation
   full_logit_distillation: True
 
@@ -115,6 +126,23 @@ self_distillation:
 
   # Whether to remove <think>...</think> tags from successful demonstrations before reprompting
   remove_thinking_from_demonstration: True
+
+  # Whether to canonicalize successful demonstrations before reprompting.
+  # Currently implemented for data_source containing "tooluse"; malformed
+  # ToolUse demonstrations are skipped instead of entering the solution pool.
+  canonicalize_successful_solution: False
+
+  # Token mask for counterfactual auxiliary distillation.
+  decision_token_mask:
+    enable: False
+    # "tooluse_action_span" keeps only valid Action/Action Input spans.
+    mode: tooluse_action_span
+
+  # Counterfactual auxiliary settings.
+  counterfactual:
+    # Signed delta is the default: negative deltas suppress bad sampled tokens.
+    positive_only: False
+    delta_clip: 5.0
 
   # Whether to include environment feedback in reprompting for wrong attempts
   # If True and feedback exists: use reprompt_template_feedback_solution (with solution) or reprompt_template_feedback (without solution)

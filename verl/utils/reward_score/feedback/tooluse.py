@@ -3,9 +3,14 @@ import json
 from collections import Counter
 
 
+_ACTION_NAME_PATTERN = r"\w+"
+_ACTION_RE = re.compile(rf"(^|\n)Action:[^\S\r\n]*({_ACTION_NAME_PATTERN})")
+_ACTION_INPUT_RE = re.compile(r"(^|\n)Action Input:[^\S\r\n]*", re.MULTILINE)
+
+
 def extract_actions(text: str) -> list[str]:
     """Extract all action names after 'Action:' occurrences."""
-    actions = re.findall(r'Action:\s*(\w+)', text)
+    actions = re.findall(rf'Action:[^\S\r\n]*({_ACTION_NAME_PATTERN})', text)
     return actions
 
 
@@ -37,6 +42,99 @@ def is_correct_format(text: str) -> bool:
     """Check if the text contains the expected Action/Action Input format."""
     pattern = re.compile(r"Action:.*?\nAction Input:.*?", re.DOTALL)
     return pattern.search(text) is not None
+
+
+def _find_json_object_end(text: str, start: int) -> int | None:
+    """Return the exclusive end offset of a JSON object starting at start."""
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return idx + 1
+    return None
+
+
+def parse_tooluse_tool_calls(text: str) -> tuple[list[dict], bool, list[tuple[int, int]]]:
+    """
+    Parse ToolUse Action/Action Input pairs.
+
+    Returns (calls, valid, spans). valid is False if any Action lacks a
+    corresponding valid JSON-object Action Input. spans are character offsets
+    covering the executable Action + Action Input portion.
+    """
+    action_matches = list(_ACTION_RE.finditer(text))
+    if not action_matches:
+        return [], False, []
+
+    calls: list[dict] = []
+    spans: list[tuple[int, int]] = []
+    for idx, action_match in enumerate(action_matches):
+        action = action_match.group(2).strip()
+        if not action:
+            return [], False, []
+
+        segment_end = action_matches[idx + 1].start() if idx + 1 < len(action_matches) else len(text)
+        input_match = _ACTION_INPUT_RE.search(text, action_match.end(), segment_end)
+        if input_match is None:
+            return [], False, []
+
+        json_start = input_match.end()
+        while json_start < segment_end and text[json_start].isspace():
+            json_start += 1
+        json_end = _find_json_object_end(text, json_start)
+        if json_end is None or json_end > segment_end:
+            return [], False, []
+
+        try:
+            action_input = json.loads(text[json_start:json_end])
+        except json.JSONDecodeError:
+            return [], False, []
+        if not isinstance(action_input, dict):
+            return [], False, []
+
+        calls.append({"Action": action, "Action_Input": action_input})
+        spans.append((action_match.start(0) + len(action_match.group(1)), json_end))
+
+    return calls, True, spans
+
+
+def canonicalize_tooluse_solution(solution: str) -> str | None:
+    """Return a canonical ToolUse solution or None if parsing fails."""
+    calls, valid, _ = parse_tooluse_tool_calls(solution)
+    if not valid or not calls:
+        return None
+    chunks = []
+    for call in calls:
+        chunks.append(f"Action: {call['Action']}")
+        chunks.append(
+            "Action Input: "
+            + json.dumps(call["Action_Input"], ensure_ascii=False, sort_keys=True)
+        )
+    return "\n".join(chunks)
+
+
+def get_tooluse_action_spans(solution: str) -> list[tuple[int, int]]:
+    """Return valid executable ToolUse spans; empty if parsing fails."""
+    _, valid, spans = parse_tooluse_tool_calls(solution)
+    return spans if valid else []
 
 
 def compute_score(solution: str, ground_truth: str) -> dict:

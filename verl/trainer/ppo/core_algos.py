@@ -1201,6 +1201,118 @@ def compute_self_distillation_loss(
     return loss, metrics
 
 
+def compute_counterfactual_ucsdpo_loss(
+    log_prob: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    teacher_priv_log_probs: torch.Tensor,
+    teacher_base_log_probs: torch.Tensor,
+    response_mask: torch.Tensor,
+    self_distillation_config: Any,
+    actor_config: ActorConfig,
+    self_distillation_mask: Optional[torch.Tensor] = None,
+    self_distillation_token_mask: Optional[torch.Tensor] = None,
+    self_distillation_weights: Optional[torch.Tensor] = None,
+    loss_agg_mode: str = "token-mean",
+    rollout_is_weights: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Counterfactual UC-SDPO auxiliary loss.
+
+    The auxiliary advantage is the EMA teacher log-probability delta on the
+    sampled token under privileged vs. baseline prompts:
+        A_t = u * M_t * clip(log p_ema(y_t | x, f) - log p_ema(y_t | x)).
+    It is optimized with the same PPO-style clipped objective as the base
+    policy loss, but only on the selected distillation mask.
+    """
+
+    loss_mask = response_mask.to(dtype=log_prob.dtype)
+    if self_distillation_mask is not None:
+        loss_mask = loss_mask * self_distillation_mask.to(dtype=loss_mask.dtype, device=loss_mask.device).unsqueeze(1)
+    if self_distillation_token_mask is not None:
+        loss_mask = loss_mask * self_distillation_token_mask.to(dtype=loss_mask.dtype, device=loss_mask.device)
+
+    if torch.count_nonzero(loss_mask).item() == 0:
+        zero = log_prob.sum() * 0.0
+        return zero, {
+            "self_distillation/cf_empty_target_tokens": 1.0,
+            "self_distillation/cf_token_fraction": 0.0,
+        }
+
+    counterfactual_cfg = self_distillation_config.get("counterfactual", {})
+    positive_only = bool(counterfactual_cfg.get("positive_only", False))
+    delta_clip = counterfactual_cfg.get("delta_clip", 5.0)
+
+    delta = (teacher_priv_log_probs - teacher_base_log_probs).detach()
+    if positive_only:
+        delta = delta.clamp(min=0.0)
+    if delta_clip is not None:
+        delta_clip = float(delta_clip)
+        if delta_clip <= 0:
+            raise ValueError("self_distillation.counterfactual.delta_clip must be positive or null")
+        delta = delta.clamp(min=0.0 if positive_only else -delta_clip, max=delta_clip)
+
+    advantages = delta
+    if self_distillation_weights is not None:
+        if self_distillation_weights.dim() != 1 or self_distillation_weights.shape[0] != advantages.shape[0]:
+            raise ValueError(
+                "self_distillation_weights must have shape (batch_size,), got "
+                f"{tuple(self_distillation_weights.shape)} for batch size {advantages.shape[0]}"
+            )
+        weights = self_distillation_weights.to(dtype=advantages.dtype, device=advantages.device)
+        advantages = advantages * weights.unsqueeze(-1)
+    else:
+        weights = None
+    advantages = advantages * loss_mask
+
+    clip_ratio = actor_config.clip_ratio
+    clip_ratio_low = actor_config.clip_ratio_low if actor_config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = actor_config.clip_ratio_high if actor_config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = actor_config.get("clip_ratio_c", 3.0)
+
+    negative_approx_kl = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * torch.clamp(ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), loss_mask)
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        torch.gt(clip_pg_losses1, pg_losses3).float() * (advantages < 0).float(), loss_mask
+    )
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=loss_mask,
+        loss_agg_mode=loss_agg_mode,
+        batch_num_tokens=loss_mask.sum().clamp(min=1.0),
+    )
+
+    masked_delta = delta * loss_mask
+    denom = loss_mask.sum().clamp(min=1.0)
+    metrics = {
+        "self_distillation/cf_loss": pg_loss.detach().item(),
+        "self_distillation/cf_delta_mean": (masked_delta.sum() / denom).detach().item(),
+        "self_distillation/cf_delta_abs_mean": ((delta.abs() * loss_mask).sum() / denom).detach().item(),
+        "self_distillation/cf_delta_positive_fraction": (((delta > 0).float() * loss_mask).sum() / denom).detach().item(),
+        "self_distillation/cf_delta_negative_fraction": (((delta < 0).float() * loss_mask).sum() / denom).detach().item(),
+        "self_distillation/cf_pg_clipfrac": pg_clipfrac.detach().item(),
+        "self_distillation/cf_pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "self_distillation/cf_token_fraction": (loss_mask.sum() / response_mask.to(dtype=loss_mask.dtype).sum().clamp(min=1.0)).detach().item(),
+        "self_distillation/cf_empty_target_tokens": 0.0,
+    }
+    if weights is not None:
+        metrics["self_distillation/cf_weight_mean"] = weights.mean().detach().item()
+        metrics["self_distillation/cf_weight_min"] = weights.min().detach().item()
+        metrics["self_distillation/cf_weight_max"] = weights.max().detach().item()
+    return pg_loss, metrics
+
+
 @deprecated("verl.trainer.ppo.core_algos.compute_policy_loss_vanilla")
 def compute_policy_loss(
     old_log_prob,

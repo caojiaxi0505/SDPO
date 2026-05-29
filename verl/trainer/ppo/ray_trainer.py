@@ -648,14 +648,27 @@ class RayPPOTrainer:
         """Remove <think>...</think> tags and their content from text."""
         return re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
 
+    @staticmethod
+    def _is_tooluse_data_source(data_source: Any) -> bool:
+        return "tooluse" in str(data_source).lower()
+
+    def _canonicalize_successful_solution(self, solution: str, data_source: Any) -> Optional[str]:
+        if not self._is_tooluse_data_source(data_source):
+            return solution
+        from verl.utils.reward_score.feedback.tooluse import canonicalize_tooluse_solution
+
+        return canonicalize_tooluse_solution(solution)
+
     def _get_solution(
         self,
         idx: int,
         success_by_uid: dict[Any, list[int]],
         uids: list[Any],
         response_texts: list[str],
+        data_sources: Optional[list[Any]] = None,
         dont_reprompt_on_self_success: bool = False,
         remove_thinking_from_demonstration: bool = False,
+        canonicalize_successful_solution: bool = False,
     ) -> Optional[str]:
         uid = uids[idx]
         solution_idxs = success_by_uid[uid]
@@ -663,11 +676,112 @@ class RayPPOTrainer:
             solution_idxs = [j for j in solution_idxs if j != idx]
         if len(solution_idxs) == 0:
             return None
-        solution_idx = solution_idxs[0]  # taking the first successful demonstration effectively selects a random one
-        solution_str = response_texts[solution_idx]
-        if remove_thinking_from_demonstration:
-            solution_str = self._remove_thinking_trace(solution_str)
-        return solution_str
+        for solution_idx in solution_idxs:
+            solution_str = response_texts[solution_idx]
+            if remove_thinking_from_demonstration:
+                solution_str = self._remove_thinking_trace(solution_str)
+            if canonicalize_successful_solution:
+                data_source = data_sources[solution_idx] if data_sources is not None else None
+                solution_str = self._canonicalize_successful_solution(solution_str, data_source)
+                if solution_str is None:
+                    continue
+            return solution_str
+        return None
+
+    def _response_token_offsets(
+        self,
+        token_ids: list[int],
+        text: str,
+    ) -> list[tuple[int, int] | None]:
+        """Map original response-token positions to offsets in decoded text.
+
+        We only use tokenizer(text) offsets when re-encoding exactly recovers
+        the original non-special token ids. Otherwise we fall back to offsets
+        computed from prefix decodes of the original ids, which is slower but
+        keeps the mask in the original response/logprob coordinate system.
+        """
+        special_ids = set(getattr(self.tokenizer, "all_special_ids", []) or [])
+        non_special_positions = [idx for idx, token_id in enumerate(token_ids) if token_id not in special_ids]
+        non_special_ids = [token_ids[idx] for idx in non_special_positions]
+        token_offsets: list[tuple[int, int] | None] = [None] * len(token_ids)
+
+        try:
+            encoded = self.tokenizer(
+                text,
+                add_special_tokens=False,
+                return_offsets_mapping=True,
+            )
+            offsets = encoded.get("offset_mapping", None)
+            encoded_ids = encoded.get("input_ids", None)
+        except (NotImplementedError, TypeError, ValueError):
+            offsets = None
+            encoded_ids = None
+        if offsets is not None and encoded_ids == non_special_ids:
+            for enc_idx, orig_idx in enumerate(non_special_positions):
+                token_offsets[orig_idx] = tuple(offsets[enc_idx])
+            return token_offsets
+
+        for orig_idx in non_special_positions:
+            start_text = self.tokenizer.decode(
+                token_ids[:orig_idx],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            end_text = self.tokenizer.decode(
+                token_ids[: orig_idx + 1],
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            token_offsets[orig_idx] = (len(start_text), len(end_text))
+        return token_offsets
+
+    def _build_self_distillation_token_mask(
+        self,
+        responses: torch.Tensor,
+        response_attention_mask: torch.Tensor,
+        response_mask: torch.Tensor,
+        data_sources: list[Any],
+        decision_token_mask_cfg: Any,
+    ) -> torch.Tensor:
+        """Build token-level mask for counterfactual auxiliary distillation."""
+        device = response_mask.device
+        if not decision_token_mask_cfg.get("enable", False):
+            return response_mask.to(dtype=torch.float32, device=device)
+        mode = decision_token_mask_cfg.get("mode", "tooluse_action_span")
+        if mode != "tooluse_action_span":
+            raise ValueError(f"Unsupported self_distillation.decision_token_mask.mode: {mode!r}")
+
+        from verl.utils.reward_score.feedback.tooluse import get_tooluse_action_spans
+
+        response_mask_cpu = response_mask.detach().cpu()
+        response_attention_mask_cpu = response_attention_mask.detach().cpu()
+        responses_cpu = responses.detach().cpu()
+        masks_cpu = torch.zeros_like(response_mask_cpu, dtype=torch.float32)
+        for i in range(responses_cpu.shape[0]):
+            if not self._is_tooluse_data_source(data_sources[i]):
+                continue
+            valid_positions = torch.nonzero(response_attention_mask_cpu[i].bool(), as_tuple=False).flatten().tolist()
+            if not valid_positions:
+                continue
+            token_ids = [int(responses_cpu[i, pos].item()) for pos in valid_positions]
+            text = self.tokenizer.decode(
+                token_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )
+            spans = get_tooluse_action_spans(text)
+            if not spans:
+                continue
+            token_offsets = self._response_token_offsets(token_ids, text)
+            for local_idx, offset in enumerate(token_offsets):
+                if offset is None:
+                    continue
+                tok_start, tok_end = offset
+                if tok_end <= tok_start:
+                    continue
+                if any(tok_start < span_end and tok_end > span_start for span_start, span_end in spans):
+                    masks_cpu[i, valid_positions[local_idx]] = 1.0
+        return masks_cpu.to(device=device) * response_mask.to(dtype=torch.float32, device=device)
 
 
     def _maybe_build_self_distillation_batch(
@@ -685,9 +799,11 @@ class RayPPOTrainer:
         device = batch.batch["input_ids"].device
         response_mask = batch.batch["response_mask"]
         responses = batch.batch["responses"]
+        response_attention_mask = batch.batch["attention_mask"][:, -responses.size(1):]
         response_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in responses]
         prompt_texts = [msgs[-1]["content"] for msgs in batch.non_tensor_batch["raw_prompt"]]
         batch_size = batch.batch.batch_size[0]
+        data_sources = list(batch.non_tensor_batch.get("data_source", [None] * batch_size))
 
         # Extract feedback if available and include_environment_feedback is enabled
         feedback_list = self._collect_feedback(
@@ -703,8 +819,10 @@ class RayPPOTrainer:
                 success_by_uid,
                 batch.non_tensor_batch["uid"],
                 response_texts,
+                data_sources,
                 self_distillation_cfg.dont_reprompt_on_self_success,
                 self_distillation_cfg.get("remove_thinking_from_demonstration", False),
+                self_distillation_cfg.get("canonicalize_successful_solution", False),
             )
             for i in range(batch_size)
         ]
@@ -778,6 +896,15 @@ class RayPPOTrainer:
             dtype=torch.float32,
             device=device
         )
+        self_distillation_token_mask = None
+        if self_distillation_cfg.get("objective", "jsd") == "counterfactual_aux":
+            self_distillation_token_mask = self._build_self_distillation_token_mask(
+                responses=responses,
+                response_attention_mask=response_attention_mask,
+                response_mask=response_mask,
+                data_sources=data_sources,
+                decision_token_mask_cfg=self_distillation_cfg.get("decision_token_mask", {}),
+            )
 
         uids = set(batch.non_tensor_batch["uid"])
         num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
@@ -790,12 +917,18 @@ class RayPPOTrainer:
             "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
             "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
         }
+        if self_distillation_token_mask is not None:
+            metrics["self_distillation/token_mask_fraction"] = (
+                self_distillation_token_mask.sum() / response_mask.sum().clamp(min=1)
+            ).item()
         tensors = {
             "teacher_input_ids": teacher_input_ids,
             "teacher_attention_mask": teacher_attention_mask,
             "teacher_position_ids": teacher_position_ids,
             "self_distillation_mask": self_distillation_mask,
         }
+        if self_distillation_token_mask is not None:
+            tensors["self_distillation_token_mask"] = self_distillation_token_mask
         if uplift_calibration_enabled:
             teacher_prompt_attention_mask = teacher_prompt["attention_mask"].to(device)
             teacher_context_keys: list[str] = []
