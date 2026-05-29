@@ -922,7 +922,7 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             pg_metrics["self_distillation/objective_counterfactual_aux"] = 0.0
 
-                        pg_metrics["self_distillation/empty_target_batch"] = self_distillation_mask.sum().item() == 0
+                        pg_metrics["self_distillation/empty_target_batch"] = float(self_distillation_mask.sum().item() == 0)
                         micro_batch_metrics.update(pg_metrics)
                     else:
                         # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg

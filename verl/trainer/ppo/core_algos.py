@@ -1230,13 +1230,6 @@ def compute_counterfactual_ucsdpo_loss(
     if self_distillation_token_mask is not None:
         loss_mask = loss_mask * self_distillation_token_mask.to(dtype=loss_mask.dtype, device=loss_mask.device)
 
-    if torch.count_nonzero(loss_mask).item() == 0:
-        zero = log_prob.sum() * 0.0
-        return zero, {
-            "self_distillation/cf_empty_target_tokens": 1.0,
-            "self_distillation/cf_token_fraction": 0.0,
-        }
-
     counterfactual_cfg = self_distillation_config.get("counterfactual", {})
     positive_only = bool(counterfactual_cfg.get("positive_only", False))
     delta_clip = counterfactual_cfg.get("delta_clip", 5.0)
@@ -1261,6 +1254,26 @@ def compute_counterfactual_ucsdpo_loss(
         advantages = advantages * weights.unsqueeze(-1)
     else:
         weights = None
+
+    if torch.count_nonzero(loss_mask).item() == 0:
+        zero = log_prob.sum() * 0.0
+        metrics = {
+            "self_distillation/cf_loss": 0.0,
+            "self_distillation/cf_delta_mean": 0.0,
+            "self_distillation/cf_delta_abs_mean": 0.0,
+            "self_distillation/cf_delta_positive_fraction": 0.0,
+            "self_distillation/cf_delta_negative_fraction": 0.0,
+            "self_distillation/cf_pg_clipfrac": 0.0,
+            "self_distillation/cf_pg_clipfrac_lower": 0.0,
+            "self_distillation/cf_token_fraction": 0.0,
+            "self_distillation/cf_empty_target_tokens": 1.0,
+        }
+        if weights is not None:
+            metrics["self_distillation/cf_weight_mean"] = weights.mean().detach().item()
+            metrics["self_distillation/cf_weight_min"] = weights.min().detach().item()
+            metrics["self_distillation/cf_weight_max"] = weights.max().detach().item()
+        return zero, metrics
+
     advantages = advantages * loss_mask
 
     clip_ratio = actor_config.clip_ratio
