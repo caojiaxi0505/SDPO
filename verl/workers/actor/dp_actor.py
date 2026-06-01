@@ -691,11 +691,13 @@ class DataParallelPPOActor(BasePPOActor):
         self_distillation_cfg = getattr(self.config, "self_distillation", None)
         sdpo_objective = "jsd"
         counterfactual_aux_enabled = False
+        ucsdpo_aux_enabled = False
         if self_distillation_enabled:
             sdpo_objective = self_distillation_cfg.get("objective", "jsd")
-            if sdpo_objective not in {"jsd", "counterfactual_aux"}:
+            if sdpo_objective not in {"jsd", "counterfactual_aux", "ucsdpo_aux"}:
                 raise ValueError(f"Unsupported self_distillation.objective: {sdpo_objective!r}")
             counterfactual_aux_enabled = sdpo_objective == "counterfactual_aux"
+            ucsdpo_aux_enabled = sdpo_objective == "ucsdpo_aux"
             self_distillation_required_keys = {
                 "teacher_input_ids",
                 "teacher_attention_mask",
@@ -837,7 +839,7 @@ class DataParallelPPOActor(BasePPOActor):
                             self.teacher_module is None or self.teacher_module is self.actor_module
                         ):
                             raise ValueError("trust-region teacher requires a separate teacher_module in the actor worker.")
-                        if counterfactual_aux_enabled:
+                        if counterfactual_aux_enabled or ucsdpo_aux_enabled:
                             base_loss_mode = self_distillation_cfg.get("auxiliary_base_loss_mode", "vanilla")
                             if base_loss_mode == "sdpo":
                                 raise ValueError("self_distillation.auxiliary_base_loss_mode cannot be 'sdpo'.")
@@ -851,6 +853,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 config=self.config,
                                 rollout_is_weights=rollout_is_weights,
                             )
+                        if counterfactual_aux_enabled:
                             teacher_base_inputs = {
                                 "responses": model_inputs["responses"],
                                 "input_ids": model_inputs["input_ids"],
@@ -891,6 +894,44 @@ class DataParallelPPOActor(BasePPOActor):
                             pg_metrics["self_distillation/auxiliary_coef"] = auxiliary_coef
                             pg_metrics["self_distillation/base_pg_loss"] = base_pg_loss.detach().item()
                             pg_metrics["self_distillation/cf_scaled_loss"] = (auxiliary_coef * cf_loss).detach().item()
+                        elif ucsdpo_aux_enabled:
+                            with torch.no_grad():
+                                teacher_outputs = self._forward_micro_batch(
+                                    teacher_inputs,
+                                    temperature=temperature,
+                                    calculate_entropy=False,
+                                    return_all_logps=return_all_logps,
+                                    distill_topk=distill_topk,
+                                    topk_indices=student_topk_indices,
+                                    module=teacher_model,
+                                )
+                            teacher_log_prob = teacher_outputs["log_probs"]
+                            teacher_all_logps = teacher_outputs.get("all_logps") if return_all_logps else None
+                            teacher_topk_logps = teacher_outputs.get("topk_logps") if distill_topk else None
+                            ucsdpo_loss, pg_metrics = compute_self_distillation_loss(
+                                student_log_probs=log_prob,
+                                teacher_log_probs=teacher_log_prob,
+                                response_mask=response_mask,
+                                self_distillation_config=self_distillation_cfg,
+                                old_log_probs=old_log_prob,
+                                student_all_log_probs=student_all_logps,
+                                teacher_all_log_probs=teacher_all_logps,
+                                student_topk_log_probs=student_topk_logps,
+                                teacher_topk_log_probs=teacher_topk_logps,
+                                self_distillation_mask=self_distillation_mask,
+                                self_distillation_weights=model_inputs.get("self_distillation_u"),
+                                loss_agg_mode=loss_agg_mode,
+                                rollout_is_weights=rollout_is_weights,
+                            )
+                            auxiliary_coef = float(self_distillation_cfg.get("auxiliary_coef", 0.2))
+                            pg_loss = base_pg_loss + auxiliary_coef * ucsdpo_loss
+                            pg_metrics.update(base_pg_metrics)
+                            pg_metrics["self_distillation/objective_counterfactual_aux"] = 0.0
+                            pg_metrics["self_distillation/objective_ucsdpo_aux"] = 1.0
+                            pg_metrics["self_distillation/auxiliary_coef"] = auxiliary_coef
+                            pg_metrics["self_distillation/base_pg_loss"] = base_pg_loss.detach().item()
+                            pg_metrics["self_distillation/ucsdpo_aux_loss"] = ucsdpo_loss.detach().item()
+                            pg_metrics["self_distillation/ucsdpo_aux_scaled_loss"] = (auxiliary_coef * ucsdpo_loss).detach().item()
                         else:
                             with torch.no_grad():
                                 teacher_outputs = self._forward_micro_batch(
@@ -921,6 +962,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 rollout_is_weights=rollout_is_weights,
                             )
                             pg_metrics["self_distillation/objective_counterfactual_aux"] = 0.0
+                            pg_metrics["self_distillation/objective_ucsdpo_aux"] = 0.0
 
                         pg_metrics["self_distillation/empty_target_batch"] = float(self_distillation_mask.sum().item() == 0)
                         micro_batch_metrics.update(pg_metrics)

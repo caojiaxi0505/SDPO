@@ -41,7 +41,8 @@ class SelfDistillationConfig(BaseConfig):
 
     Args:
         Distillation is enabled when policy_loss.loss_mode == "sdpo".
-        objective (str): "jsd" preserves original SDPO; "counterfactual_aux" adds privileged auxiliary loss.
+        objective (str): "jsd" preserves original SDPO; "counterfactual_aux" adds privileged auxiliary loss;
+            "ucsdpo_aux" adds the original UCSDPO/JSD loss as an auxiliary loss to a base policy loss.
         auxiliary_coef (float): Coefficient for counterfactual auxiliary loss.
         auxiliary_base_loss_mode (str): Base policy loss used by counterfactual auxiliary mode.
         full_logit_distillation (bool): Whether to use full-logit KL distillation.
@@ -130,9 +131,9 @@ class SelfDistillationConfig(BaseConfig):
     )
 
     def __post_init__(self):
-        if self.objective not in {"jsd", "counterfactual_aux"}:
+        if self.objective not in {"jsd", "counterfactual_aux", "ucsdpo_aux"}:
             raise ValueError(
-                "self_distillation.objective must be one of {'jsd', 'counterfactual_aux'}, "
+                "self_distillation.objective must be one of {'jsd', 'counterfactual_aux', 'ucsdpo_aux'}, "
                 f"got {self.objective}"
             )
         if self.auxiliary_coef < 0:
