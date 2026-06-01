@@ -86,12 +86,14 @@ self_distillation:
   # Self-distillation objective. "jsd" preserves the original SDPO behavior.
   # "counterfactual_aux" keeps the GRPO/PPO policy loss as the main objective
   # and adds a signed privileged-vs-baseline EMA teacher auxiliary loss.
+  # "ucsdpo_aux" keeps the configured base policy loss as the main objective
+  # and adds the original UCSDPO/JSD self-distillation loss as an auxiliary loss.
   objective: jsd
 
-  # Auxiliary coefficient for objective=counterfactual_aux.
+  # Auxiliary coefficient for objectives that add a self-distillation auxiliary loss.
   auxiliary_coef: 0.2
 
-  # Base policy loss used by objective=counterfactual_aux.
+  # Base policy loss used by auxiliary objectives such as counterfactual_aux and ucsdpo_aux.
   auxiliary_base_loss_mode: vanilla
 
   # Whether to use full-logit KL distillation
