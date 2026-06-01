@@ -1,0 +1,48 @@
+cd /cfs_turbo/jiaxicao/OPSD
+export TENSORBOARD_DIR=/cfs_turbo/jiaxicao/tensorboard/ucsdpo-tooluse-qwen3-8b-cfaux-signed-actionmask-canon-emajf-vllm-h20-260530
+export ROLLOUT_DIR=/cfs_turbo/jiaxicao/rollouts/ucsdpo-tooluse-qwen3-8b-cfaux-signed-actionmask-canon-emajf-vllm-h20-260530
+export TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+bash training/verl_training.sh \
+  ucsdpo-tooluse-qwen3-8b-cfaux-signed-actionmask-canon-emajf-vllm-h20-260530 \
+  sdpo \
+  datasets/tooluse \
+  vars.dir=/cfs_turbo/jiaxicao/OPSD \
+  trainer.n_gpus_per_node=4 \
+  actor_rollout_ref.model.path=/cfs_turbo/jiaxicao/ckpt/hf/Qwen3-8B \
+  critic.model.path=/cfs_turbo/jiaxicao/ckpt/hf/Qwen3-8B \
+  data.train_batch_size=32 \
+  actor_rollout_ref.rollout.n=8 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+  data.max_response_length=8192 \
+  max_model_len=18944 \
+  actor_rollout_ref.rollout.val_kwargs.n=16 \
+  actor_rollout_ref.actor.self_distillation.objective=counterfactual_aux \
+  actor_rollout_ref.actor.self_distillation.auxiliary_coef=0.02 \
+  actor_rollout_ref.actor.self_distillation.auxiliary_base_loss_mode=vanilla \
+  actor_rollout_ref.actor.self_distillation.counterfactual.positive_only=True \
+  actor_rollout_ref.actor.self_distillation.counterfactual.delta_clip=2.0 \
+  actor_rollout_ref.actor.self_distillation.decision_token_mask.enable=True \
+  actor_rollout_ref.actor.self_distillation.decision_token_mask.mode=tooluse_action_span \
+  actor_rollout_ref.actor.self_distillation.canonicalize_successful_solution=True \
+  actor_rollout_ref.actor.self_distillation.distillation_topk=100 \
+  actor_rollout_ref.actor.self_distillation.alpha=0.5 \
+  actor_rollout_ref.actor.self_distillation.dont_reprompt_on_self_success=True \
+  actor_rollout_ref.actor.self_distillation.include_environment_feedback=False \
+  actor_rollout_ref.actor.self_distillation.uplift_calibration.enable=True \
+  actor_rollout_ref.actor.self_distillation.uplift_calibration.jf_policy=ema_teacher_vllm \
+  actor_rollout_ref.actor.self_distillation.uplift_calibration.num_samples=1 \
+  actor_rollout_ref.actor.self_distillation.uplift_calibration.aggregation=uid \
+  actor_rollout_ref.actor.self_distillation.uplift_calibration.reward_upper_bound=1.0 \
+  algorithm.rollout_correction.rollout_is=token \
+  trainer.total_epochs=5 \
+  trainer.test_freq=5 \
+  trainer.save_freq=50 \
+  trainer.max_actor_ckpt_to_keep=20 \
+  trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/ucsdpo-tooluse-qwen3-8b-cfaux-signed-actionmask-canon-emajf-vllm-h20-260530 \
+  trainer.rollout_data_dir=${ROLLOUT_DIR}/train \
+  trainer.validation_data_dir=${ROLLOUT_DIR}/val \
+  'trainer.logger=["console","tensorboard"]' \
+  2>&1 | tee /cfs_turbo/jiaxicao/logs/ucsdpo/ucsdpo-tooluse-qwen3-8b-cfaux-signed-actionmask-canon-emajf-vllm-h20-260530.log
