@@ -1,0 +1,31 @@
+cd /cfs_turbo/jiaxicao/OPSD
+export TENSORBOARD_DIR=/cfs_turbo/jiaxicao/tensorboard/grpo-apigen-qwen3-8b-h20-260601
+export ROLLOUT_DIR=/cfs_turbo/jiaxicao/rollouts/grpo-apigen-qwen3-8b-h20-260601
+export TOKENIZERS_PARALLELISM=false
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+bash training/verl_training.sh \
+  grpo-apigen-qwen3-8b-h20-260601 \
+  baseline_grpo \
+  datasets/apigen \
+  vars.dir=/cfs_turbo/jiaxicao/OPSD \
+  trainer.n_gpus_per_node=4 \
+  actor_rollout_ref.model.path=/cfs_turbo/jiaxicao/ckpt/hf/Qwen3-8B \
+  critic.model.path=/cfs_turbo/jiaxicao/ckpt/hf/Qwen3-8B \
+  data.train_batch_size=32 \
+  actor_rollout_ref.rollout.n=8 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+  data.max_response_length=8192 \
+  max_model_len=18944 \
+  actor_rollout_ref.rollout.val_kwargs.n=16 \
+  algorithm.rollout_correction.rollout_is=token \
+  trainer.total_epochs=1 \
+  trainer.test_freq=5 \
+  trainer.save_freq=50 \
+  trainer.max_actor_ckpt_to_keep=20 \
+  trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/grpo-apigen-qwen3-8b-h20-260601 \
+  trainer.rollout_data_dir=${ROLLOUT_DIR}/train \
+  trainer.validation_data_dir=${ROLLOUT_DIR}/val \
+  'trainer.logger=["console","tensorboard"]' \
+  2>&1 | tee /cfs_turbo/jiaxicao/logs/ucsdpo/grpo-apigen-qwen3-8b-h20-260601.log
