@@ -3,19 +3,21 @@ import json
 from collections import Counter
 
 
-_ACTION_NAME_PATTERN = r"\w+"
-_ACTION_RE = re.compile(rf"(^|\n)Action:[^\S\r\n]*({_ACTION_NAME_PATTERN})")
+_ACTION_RE = re.compile(r"(^|\n)Action:[^\S\r\n]*([^\r\n]+)")
 _ACTION_INPUT_RE = re.compile(r"(^|\n)Action Input:[^\S\r\n]*", re.MULTILINE)
 
 
 def extract_actions(text: str) -> list[str]:
     """Extract all action names after 'Action:' occurrences."""
-    actions = re.findall(rf'Action:[^\S\r\n]*({_ACTION_NAME_PATTERN})', text)
-    return actions
+    return [match.group(2).strip() for match in _ACTION_RE.finditer(text) if match.group(2).strip()]
 
 
 def extract_action_inputs(text: str) -> dict:
     """Extract and merge all JSON blocks following 'Action Input:'."""
+    calls, valid, _ = parse_tooluse_tool_calls(text)
+    if valid:
+        return merge_action_inputs([call["Action_Input"] for call in calls])
+
     json_blocks = re.findall(r'Action Input:\s*({.*?})', text, re.DOTALL)
     
     combined_dict = {}
@@ -36,6 +38,23 @@ def merge_action_inputs(action_inputs_list: list[dict]) -> dict:
         if d:
             combined.update(d)
     return combined
+
+
+def _call_counter(calls: list[dict]) -> Counter:
+    serialized_calls = []
+    for call in calls:
+        serialized_calls.append(
+            json.dumps(
+                {
+                    "Action": call["Action"],
+                    "Action_Input": call["Action_Input"],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    return Counter(serialized_calls)
 
 
 def is_correct_format(text: str) -> bool:
@@ -165,31 +184,40 @@ def compute_score(solution: str, ground_truth: str) -> dict:
                 "feedback": "Failed to parse ground truth JSON",
             }
     
-    # Extract ground truth actions and action inputs
-    gt_actions = [item['Action'] for item in gt_list]
-    gt_action_inputs_list = []
+    # Extract ground truth calls.
+    gt_calls = []
     for item in gt_list:
         try:
             parsed_input = json.loads(item['Action_Input']) if isinstance(item['Action_Input'], str) else item['Action_Input']
-            gt_action_inputs_list.append(parsed_input)
+            if not isinstance(parsed_input, dict):
+                parsed_input = {}
+            gt_calls.append({"Action": item["Action"], "Action_Input": parsed_input})
         except (json.JSONDecodeError, KeyError):
-            gt_action_inputs_list.append({})
+            gt_calls.append({"Action": item.get("Action", ""), "Action_Input": {}})
+    gt_actions = [item["Action"] for item in gt_calls]
+    gt_action_inputs_list = [item["Action_Input"] for item in gt_calls]
     gt_action_inputs = merge_action_inputs(gt_action_inputs_list)
     
     # Extract predicted actions and action inputs from solution
-    pred_actions = extract_actions(solution)
-    pred_action_inputs = extract_action_inputs(solution)
+    pred_calls, pred_valid, _ = parse_tooluse_tool_calls(solution)
+    if pred_valid:
+        pred_actions = [item["Action"] for item in pred_calls]
+        pred_action_inputs = merge_action_inputs([item["Action_Input"] for item in pred_calls])
+    else:
+        pred_actions = extract_actions(solution)
+        pred_action_inputs = extract_action_inputs(solution)
     
     # Check correctness
     actions_correct = Counter(pred_actions) == Counter(gt_actions)
     action_inputs_correct = pred_action_inputs == gt_action_inputs
+    calls_correct = pred_valid and _call_counter(pred_calls) == _call_counter(gt_calls)
     
     # Both must be correct for full score
-    is_correct = actions_correct and action_inputs_correct
+    is_correct = calls_correct
     reward = 1.0 if is_correct else 0.0
     
     # Check format
-    correct_format = is_correct_format(solution)
+    correct_format = pred_valid or is_correct_format(solution)
     
     # Build prediction string for logging
     prediction = f"Actions: {pred_actions}, Inputs: {pred_action_inputs}"
@@ -200,6 +228,8 @@ def compute_score(solution: str, ground_truth: str) -> dict:
         feedback_parts.append(f"Actions mismatch: predicted {pred_actions}, expected {gt_actions}")
     if not action_inputs_correct:
         feedback_parts.append(f"Action inputs mismatch: predicted {pred_action_inputs}, expected {gt_action_inputs}")
+    if actions_correct and action_inputs_correct and not calls_correct:
+        feedback_parts.append(f"Tool calls mismatch: predicted {pred_calls}, expected {gt_calls}")
 
     if len(feedback_parts) == 0:
         feedback = "" # no feedback means correct

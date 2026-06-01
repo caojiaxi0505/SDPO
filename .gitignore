@@ -133,3 +133,9 @@ outputs
 other_implementation
 Dockerfile.gh200-ofi
 DOCKER_PLAN_GH200.md
+
+# large converted dataset files (kept local, regenerated via data/convert_function_calling_datasets.py)
+datasets/apigen/train.json
+datasets/apigen/test.json
+datasets/toolace/train.json
+datasets/toolace/test.json

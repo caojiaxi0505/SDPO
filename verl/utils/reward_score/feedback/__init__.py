@@ -19,7 +19,7 @@ def compute_score(
         results = gpqa.compute_score(solution_str, ground_truth)
     elif data_source in ["sciknoweval"]:
         results = mcq.compute_score(solution_str, ground_truth)
-    elif data_source in ["tooluse"]:
+    elif "tooluse" in str(data_source).lower():
         results = tooluse.compute_score(solution_str, ground_truth)
     else:
         raise ValueError(f"Reward style {data_source} not found.")
