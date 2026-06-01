@@ -4,6 +4,7 @@ import argparse
 import ast
 import json
 import random
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +45,7 @@ def make_prompt(query: str, tools: list[dict[str, Any]]) -> str:
             "Use the following format:",
             "Thought: you should always think about what to do",
             "Action: the action to take, should be one of the function names.",
-            "Action Input: the input to the action, must be in JSON format. All of the action input must be realistic and from the user.",
+            "Action Input: the input to the action, must be in JSON format. All action inputs must be grounded in the user request or conversation context.",
             "",
             "Begin!",
             f"Question: {query}",
@@ -71,6 +72,7 @@ def make_verl_row(
     ground_truth: str,
     source_dataset: str,
     source_id: str,
+    source_group: str,
     split: str,
     num_tools: int,
     num_calls: int,
@@ -85,6 +87,7 @@ def make_verl_row(
             "index": source_id,
             "source_dataset": source_dataset,
             "source_id": source_id,
+            "source_group": source_group,
             "num_tools": num_tools,
             "num_calls": num_calls,
         },
@@ -122,6 +125,129 @@ def split_rows(rows: list[dict[str, Any]], val_ratio: float, seed: int) -> tuple
     return train_rows, val_rows
 
 
+def split_rows_by_group(
+    rows: list[dict[str, Any]], val_ratio: float, seed: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if not 0 <= val_ratio < 1:
+        raise ValueError(f"val_ratio must be in [0, 1), got {val_ratio}")
+
+    groups = sorted({row["extra_info"]["source_group"] for row in rows})
+    random.Random(seed).shuffle(groups)
+    val_size = int(round(len(groups) * val_ratio))
+    if val_ratio > 0 and len(groups) > 1:
+        val_size = max(1, val_size)
+    val_groups = set(groups[:val_size])
+
+    train_rows = []
+    val_rows = []
+    for row in rows:
+        out = dict(row)
+        out["extra_info"] = dict(row["extra_info"])
+        if row["extra_info"]["source_group"] in val_groups:
+            out["extra_info"]["split"] = "test"
+            val_rows.append(out)
+        else:
+            out["extra_info"]["split"] = "train"
+            train_rows.append(out)
+    return train_rows, val_rows
+
+
+def update_stats(stats: Counter, prefix: str, reason: str) -> None:
+    stats[f"{prefix}/{reason}"] += 1
+
+
+def validate_calls(calls: Any, source_id: str) -> list[dict[str, Any]]:
+    if not isinstance(calls, list):
+        raise ValueError(f"{source_id}: answers must be a list")
+    if len(calls) == 0:
+        raise ValueError(f"{source_id}: answers must be non-empty")
+
+    normalized = []
+    for call_idx, call in enumerate(calls):
+        if not isinstance(call, dict):
+            raise ValueError(f"{source_id}: answer {call_idx} must be an object")
+        name = str(call.get("name", "")).strip()
+        if not name:
+            raise ValueError(f"{source_id}: answer {call_idx} missing name")
+        arguments = call.get("arguments", {})
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            raise ValueError(f"{source_id}: answer {call_idx} arguments must be an object")
+        normalized.append({"name": name, "arguments": arguments})
+    return normalized
+
+
+def validate_tools(tools: Any, source_id: str) -> list[dict[str, Any]]:
+    if not isinstance(tools, list):
+        raise ValueError(f"{source_id}: tools must be a list")
+    if len(tools) == 0:
+        raise ValueError(f"{source_id}: tools must be non-empty")
+    for tool_idx, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            raise ValueError(f"{source_id}: tool {tool_idx} must be an object")
+        if not str(tool.get("name", "")).strip():
+            raise ValueError(f"{source_id}: tool {tool_idx} missing name")
+    return tools
+
+
+def print_counter(title: str, stats: Counter) -> None:
+    print(f"{title}:")
+    for key in sorted(stats):
+        print(f"  {key}={stats[key]}")
+
+
+def lint_rows(rows: list[dict[str, Any]], dataset_name: str) -> None:
+    stats = Counter()
+    prompt_lengths = []
+    num_calls = []
+    bad_examples = []
+
+    for row in rows:
+        prompt = row["prompt"][0]["content"]
+        prompt_lengths.append(len(prompt))
+        try:
+            gt_calls = json.loads(row["reward_model"]["ground_truth"])
+        except Exception:
+            update_stats(stats, "lint", "bad_ground_truth_json")
+            continue
+        if not isinstance(gt_calls, list) or len(gt_calls) == 0:
+            update_stats(stats, "lint", "empty_ground_truth")
+            continue
+
+        num_calls.append(len(gt_calls))
+        for call in gt_calls:
+            action = call.get("Action")
+            action_input = call.get("Action_Input")
+            if f"Name: {action}" not in prompt:
+                update_stats(stats, "lint", "action_not_in_prompt")
+                if len(bad_examples) < 3:
+                    bad_examples.append(action)
+            try:
+                parsed_input = json.loads(action_input) if isinstance(action_input, str) else action_input
+            except Exception:
+                update_stats(stats, "lint", "bad_action_input_json")
+                continue
+            if not isinstance(parsed_input, dict):
+                update_stats(stats, "lint", "action_input_not_dict")
+
+    if prompt_lengths:
+        sorted_lengths = sorted(prompt_lengths)
+        stats["lint/prompt_chars_min"] = sorted_lengths[0]
+        stats["lint/prompt_chars_p50"] = sorted_lengths[len(sorted_lengths) // 2]
+        stats["lint/prompt_chars_p95"] = sorted_lengths[int(0.95 * (len(sorted_lengths) - 1))]
+        stats["lint/prompt_chars_max"] = sorted_lengths[-1]
+    if num_calls:
+        sorted_calls = sorted(num_calls)
+        stats["lint/num_calls_min"] = sorted_calls[0]
+        stats["lint/num_calls_p50"] = sorted_calls[len(sorted_calls) // 2]
+        stats["lint/num_calls_max"] = sorted_calls[-1]
+
+    print_counter(f"{dataset_name} lint", stats)
+    if bad_examples:
+        print(f"{dataset_name} lint/action_not_in_prompt_examples={bad_examples}")
+
+
 def load_json_value(value: Any, field: str, source_id: str) -> Any:
     if isinstance(value, str):
         return json.loads(value)
@@ -136,19 +262,26 @@ def convert_apigen(root: Path, val_ratio: float, seed: int) -> None:
         raw_rows = json.load(f)
 
     rows = []
-    skipped = 0
+    stats = Counter()
     for raw in raw_rows:
         source_id = f"apigen-{raw.get('id')}"
         try:
+            if "query" not in raw or not str(raw.get("query", "")).strip():
+                raise ValueError(f"{source_id}: missing query")
             tools = load_json_value(raw.get("tools"), "tools", source_id)
             calls = load_json_value(raw.get("answers"), "answers", source_id)
-            if not isinstance(tools, list) or not isinstance(calls, list) or len(calls) == 0:
-                skipped += 1
-                continue
+            tools = validate_tools(tools, source_id)
+            calls = validate_calls(calls, source_id)
             prompt = make_prompt(str(raw["query"]), tools)
             ground_truth = calls_to_ground_truth(calls)
+        except json.JSONDecodeError:
+            update_stats(stats, "skip", "json_parse_error")
+            continue
+        except ValueError as exc:
+            update_stats(stats, "skip", str(exc).split(": ", 1)[-1].replace(" ", "_"))
+            continue
         except Exception:
-            skipped += 1
+            update_stats(stats, "skip", "unexpected_error")
             continue
 
         rows.append(
@@ -158,16 +291,20 @@ def convert_apigen(root: Path, val_ratio: float, seed: int) -> None:
                 ground_truth=ground_truth,
                 source_dataset="apigen",
                 source_id=source_id,
+                source_group=source_id,
                 split="train",
                 num_tools=len(tools),
                 num_calls=len(calls),
             )
         )
+        update_stats(stats, "keep", "rows")
 
     train_rows, val_rows = split_rows(rows, val_ratio=val_ratio, seed=seed)
+    lint_rows(rows, "apigen")
     write_jsonl(train_rows, root / "train.json")
     write_jsonl(val_rows, root / "test.json")
-    print(f"apigen: converted={len(rows)} train={len(train_rows)} test={len(val_rows)} skipped={skipped}")
+    print(f"apigen: converted={len(rows)} train={len(train_rows)} test={len(val_rows)} skipped={sum(v for k, v in stats.items() if k.startswith('skip/'))}")
+    print_counter("apigen stats", stats)
 
 
 def find_matching(text: str, start: int, open_ch: str, close_ch: str) -> int | None:
@@ -331,35 +468,41 @@ def convert_toolace(root: Path, val_ratio: float, seed: int) -> None:
         raw_rows = json.load(f)
 
     rows = []
-    skipped_items = 0
-    skipped_turns = 0
+    stats = Counter()
     for item_idx, raw in enumerate(raw_rows):
         source_prefix = f"toolace-{item_idx}"
         try:
             tools = extract_toolace_tools(raw["system"])
             if not tools:
-                skipped_items += 1
+                update_stats(stats, "skip_item", "missing_tools")
                 continue
+            tools = validate_tools(tools, source_prefix)
         except Exception:
-            skipped_items += 1
+            update_stats(stats, "skip_item", "tool_parse_error")
             continue
 
         conversations = raw.get("conversations", [])
         if not isinstance(conversations, list):
-            skipped_items += 1
+            update_stats(stats, "skip_item", "bad_conversations")
             continue
 
         emitted_for_item = 0
         for turn_idx, turn in enumerate(conversations):
             if turn.get("from") != "assistant":
                 continue
+            update_stats(stats, "turn", "assistant_total")
             calls = parse_toolace_calls(str(turn.get("value", "")))
             if not calls:
+                if str(turn.get("value", "")).strip().startswith("["):
+                    update_stats(stats, "turn", "parser_failed_toollike")
                 continue
+            update_stats(stats, "turn", "assistant_call_total")
             context = conversations[:turn_idx]
             if not context or context[-1].get("from") != "user":
-                skipped_turns += 1
+                prev_role = "none" if not context else str(context[-1].get("from", "unknown"))
+                update_stats(stats, "skip_turn", f"prev_{prev_role}")
                 continue
+            update_stats(stats, "turn", "kept_prev_user")
             source_id = f"{source_prefix}-turn{turn_idx}"
             prompt = make_prompt(render_toolace_context(context), tools)
             ground_truth = calls_to_ground_truth(calls)
@@ -370,6 +513,7 @@ def convert_toolace(root: Path, val_ratio: float, seed: int) -> None:
                     ground_truth=ground_truth,
                     source_dataset="toolace",
                     source_id=source_id,
+                    source_group=source_prefix,
                     split="train",
                     num_tools=len(tools),
                     num_calls=len(calls),
@@ -377,16 +521,23 @@ def convert_toolace(root: Path, val_ratio: float, seed: int) -> None:
             )
             emitted_for_item += 1
         if emitted_for_item == 0:
-            skipped_turns += 1
+            update_stats(stats, "skip_item", "no_kept_turns")
 
-    train_rows, val_rows = split_rows(rows, val_ratio=val_ratio, seed=seed)
+    train_rows, val_rows = split_rows_by_group(rows, val_ratio=val_ratio, seed=seed)
+    train_groups = {row["extra_info"]["source_group"] for row in train_rows}
+    val_groups = {row["extra_info"]["source_group"] for row in val_rows}
+    overlap = train_groups & val_groups
+    if overlap:
+        raise ValueError(f"ToolACE group split leaked {len(overlap)} groups")
+    lint_rows(rows, "toolace")
     write_jsonl(train_rows, root / "train.json")
     write_jsonl(val_rows, root / "test.json")
     print(
         "toolace: "
         f"converted={len(rows)} train={len(train_rows)} test={len(val_rows)} "
-        f"skipped_items={skipped_items} skipped_turns={skipped_turns}"
+        f"train_groups={len(train_groups)} test_groups={len(val_groups)}"
     )
+    print_counter("toolace stats", stats)
 
 
 def parse_args() -> argparse.Namespace:

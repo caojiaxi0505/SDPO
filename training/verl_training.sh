@@ -24,4 +24,34 @@ echo "Config: $CONFIG_NAME"
 echo "Task: $TASK"
 echo "Arguments: $@"
 
+has_override() {
+    local key="$1"
+    shift
+    for arg in "$@"; do
+        case "$arg" in
+            ${key}=*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+case "$TASK" in
+    datasets/apigen|datasets/toolace|*/datasets/apigen|*/datasets/toolace)
+        if [[ "$TASK" = /* ]]; then
+            DATASET_DIR="$TASK"
+        else
+            DATASET_DIR="${PWD}/${TASK}"
+        fi
+        if [ ! -f "${DATASET_DIR}/train.json" ] || [ ! -f "${DATASET_DIR}/test.json" ]; then
+            python data/convert_function_calling_datasets.py --datasets "$(basename "$TASK")" --base-dir "$(dirname "$DATASET_DIR")"
+        fi
+        if ! has_override "data.train_files" "$@"; then
+            set -- "$@" "data.train_files=[\"${DATASET_DIR}/train.json\"]"
+        fi
+        if ! has_override "data.val_files" "$@"; then
+            set -- "$@" "data.val_files=[\"${DATASET_DIR}/test.json\"]"
+        fi
+        ;;
+esac
+
 python -m verl.trainer.main_ppo --config-name $CONFIG_NAME "$@"
