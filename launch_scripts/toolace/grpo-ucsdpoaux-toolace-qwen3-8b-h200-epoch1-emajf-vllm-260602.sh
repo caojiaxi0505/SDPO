@@ -1,20 +1,22 @@
-cd /cfs_turbo/jiaxicao/OPSD
-export TENSORBOARD_DIR=/cfs_turbo/jiaxicao/tensorboard/grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h20-260602
-export ROLLOUT_DIR=/cfs_turbo/jiaxicao/rollouts/grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h20-260602
+cd /mnt/fsx/youtu-agent/jiaxicao/SDPO
+export TENSORBOARD_DIR=/mnt/fsx/youtu-agent/jiaxicao/tensorboard/grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h200-260602
+export ROLLOUT_DIR=/mnt/fsx/youtu-agent/jiaxicao/rollouts/grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h200-260602
 export TOKENIZERS_PARALLELISM=false
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
 bash training/verl_training.sh \
-  grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h20-260602 \
+  grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h200-260602 \
   sdpo \
   datasets/toolace \
-  vars.dir=/cfs_turbo/jiaxicao/OPSD \
-  trainer.n_gpus_per_node=4 \
-  actor_rollout_ref.model.path=/cfs_turbo/jiaxicao/ckpt/hf/Qwen3-8B \
-  critic.model.path=/cfs_turbo/jiaxicao/ckpt/hf/Qwen3-8B \
-  data.train_batch_size=32 \
+  vars.dir=/mnt/fsx/youtu-agent/jiaxicao/SDPO \
+  trainer.n_gpus_per_node=8 \
+  actor_rollout_ref.model.path=/mnt/fsx/youtu-agent/public-model/Qwen/Qwen3-8B \
+  critic.model.path=/mnt/fsx/youtu-agent/public-model/Qwen/Qwen3-8B \
+  data.train_batch_size=64 \
   actor_rollout_ref.rollout.n=8 \
-  actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-  actor_rollout_ref.actor.optim.lr=1e-6 \
+  actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+  actor_rollout_ref.actor.optim.lr=2e-6 \
   actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
   data.max_response_length=8192 \
   max_model_len=18944 \
@@ -34,10 +36,10 @@ bash training/verl_training.sh \
   algorithm.rollout_correction.rollout_is=token \
   trainer.total_epochs=1 \
   trainer.test_freq=10 \
-  trainer.save_freq=50 \
+  trainer.save_freq=10 \
   trainer.max_actor_ckpt_to_keep=20 \
-  trainer.default_local_dir=/cfs_turbo/jiaxicao/ckpt/ucsdpo_runs/grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h20-260602 \
+  trainer.default_local_dir=/mnt/fsx/youtu-agent/jiaxicao/ckpt/ucsdpo_runs/grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h200-260602 \
   trainer.rollout_data_dir=${ROLLOUT_DIR}/train \
   trainer.validation_data_dir=${ROLLOUT_DIR}/val \
   'trainer.logger=["console","tensorboard"]' \
-  2>&1 | tee /cfs_turbo/jiaxicao/logs/ucsdpo/grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h20-260602.log
+  2>&1 | tee /mnt/fsx/youtu-agent/jiaxicao/logs/ucsdpo/grpo-ucsdpoaux-toolace-qwen3-8b-emajf-vllm-h200-260602.log
