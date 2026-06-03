@@ -5,7 +5,7 @@ def extract_xml_answer(text: str) -> str:
     """Extract answer from XML-formatted text."""
     answer = text.split("<answer>")[-1]
     answer = answer.split("</answer>")[0]
-    return answer.strip()
+    return answer.strip().upper()
 
 def is_correct_format(text: str) -> bool:
     """
@@ -13,17 +13,17 @@ def is_correct_format(text: str) -> bool:
 
     The text should contain at the end of the text:
     <answer>
-    (A|B|C|D)
+    A single uppercase option letter
     </answer>
     """
-    pattern = r"<answer>\s*(A|B|C|D)\s*</answer>$"
+    pattern = r"<answer>\s*[A-Z]\s*</answer>\s*$"
     return re.search(pattern, text) is not None
 
 def compute_score(solution: str, ground_truth: str) -> dict:
     multiple_choice_answer = extract_xml_answer(solution)
 
-    reward = float(multiple_choice_answer == ground_truth)
-    incorrect_format = is_correct_format(solution)
+    reward = float(multiple_choice_answer == str(ground_truth).strip().upper())
+    incorrect_format = not is_correct_format(solution)
 
     return {
       "score": reward,

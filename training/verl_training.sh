@@ -52,6 +52,22 @@ case "$TASK" in
             set -- "$@" "data.val_files=[\"${DATASET_DIR}/test.json\"]"
         fi
         ;;
+    datasets/openr1_math|datasets/taco|datasets/scienceqa|*/datasets/openr1_math|*/datasets/taco|*/datasets/scienceqa)
+        if [[ "$TASK" = /* ]]; then
+            DATASET_DIR="$TASK"
+        else
+            DATASET_DIR="${PWD}/${TASK}"
+        fi
+        if [ ! -f "${DATASET_DIR}/train.json" ] || [ ! -f "${DATASET_DIR}/test.json" ]; then
+            python data/convert_rlvr_datasets.py --datasets "$(basename "$TASK")" --base-dir "$(dirname "$DATASET_DIR")"
+        fi
+        if ! has_override "data.train_files" "$@"; then
+            set -- "$@" "data.train_files=[\"${DATASET_DIR}/train.json\"]"
+        fi
+        if ! has_override "data.val_files" "$@"; then
+            set -- "$@" "data.val_files=[\"${DATASET_DIR}/test.json\"]"
+        fi
+        ;;
 esac
 
 python -m verl.trainer.main_ppo --config-name $CONFIG_NAME "$@"
